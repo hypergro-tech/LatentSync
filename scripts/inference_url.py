@@ -6,6 +6,7 @@ import os
 import subprocess
 import tempfile
 import urllib.request
+import urllib.error
 from pathlib import Path
 from omegaconf import OmegaConf
 import torch
@@ -18,18 +19,72 @@ from DeepCache import DeepCacheSDHelper
 
 
 def download_file(url, temp_dir):
-    """Download file from URL to temporary directory"""
-    filename = os.path.basename(url.split('?')[0])  # Remove query parameters
-    if not filename:
-        # Generate filename based on content type or use generic name
-        filename = "downloaded_file"
+    """Download file from URL to temporary directory with proper error handling"""
+    try:
+        print(f"Starting download from: {url}")
 
-    filepath = os.path.join(temp_dir, filename)
-    # Convert to absolute path
-    filepath = os.path.abspath(filepath)
-    print(f"Downloading {url} to {filepath}")
-    urllib.request.urlretrieve(url, filepath)
-    return filepath
+        # Create a request with headers to avoid blocking
+        request = urllib.request.Request(url, headers={
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        })
+
+        # Get filename from URL
+        filename = os.path.basename(url.split('?')[0])  # Remove query parameters
+        if not filename or '.' not in filename:
+            # Try to get filename from response headers
+            try:
+                response = urllib.request.urlopen(request)
+                content_disposition = response.headers.get('content-disposition')
+                if content_disposition:
+                    import re
+                    filename_match = re.findall('filename=(.+)', content_disposition)
+                    if filename_match:
+                        filename = filename_match[0].strip('"')
+                response.close()
+            except:
+                pass
+
+            # Fall back to generic name with extension guessing
+            if not filename or '.' not in filename:
+                if 'video' in url.lower() or url.endswith('.mp4'):
+                    filename = "downloaded_video.mp4"
+                elif 'audio' in url.lower() or url.endswith(('.mp3', '.wav', '.mpga')):
+                    filename = "downloaded_audio" + (os.path.splitext(url)[1] or '.mp3')
+                else:
+                    filename = "downloaded_file"
+
+        filepath = os.path.join(temp_dir, filename)
+        filepath = os.path.abspath(filepath)
+
+        print(f"Downloading to: {filepath}")
+        print(f"File will be saved as: {filename}")
+
+        # Download with progress
+        def progress_hook(block_num, block_size, total_size):
+            if total_size > 0:
+                percent = min(100, (block_num * block_size * 100) / total_size)
+                print(f"\rDownload progress: {percent:.1f}%", end='', flush=True)
+
+        urllib.request.urlretrieve(url, filepath, reporthook=progress_hook)
+        print()  # New line after progress
+
+        # Verify download
+        if not os.path.exists(filepath):
+            raise RuntimeError(f"Download failed - file not created: {filepath}")
+
+        file_size = os.path.getsize(filepath)
+        if file_size == 0:
+            raise RuntimeError(f"Download failed - empty file: {filepath}")
+
+        print(f"Download successful: {filepath} ({file_size} bytes)")
+        return filepath
+
+    except urllib.error.HTTPError as e:
+        raise RuntimeError(f"HTTP Error {e.code}: {e.reason} for URL: {url}")
+    except urllib.error.URLError as e:
+        raise RuntimeError(f"URL Error: {e.reason} for URL: {url}")
+    except Exception as e:
+        raise RuntimeError(f"Download failed for {url}: {str(e)}")
 
 
 def convert_audio_to_wav(input_path, output_path):
@@ -41,17 +96,21 @@ def convert_audio_to_wav(input_path, output_path):
     print(f"Converting audio {input_path} to WAV format: {output_path}")
 
     try:
-        subprocess.run([
+        result = subprocess.run([
             'ffmpeg', '-i', input_path,
             '-ar', '16000',  # Sample rate for whisper
             '-ac', '1',      # Mono channel
             '-f', 'wav',
             '-y',            # Overwrite output file
             output_path
-        ], check=True, capture_output=True)
+        ], check=True, capture_output=True, text=True)
         print(f"Audio conversion completed: {output_path}")
     except subprocess.CalledProcessError as e:
-        raise RuntimeError(f"FFmpeg conversion failed: {e.stderr.decode()}")
+        print(f"FFmpeg stderr: {e.stderr}")
+        print(f"FFmpeg stdout: {e.stdout}")
+        raise RuntimeError(f"FFmpeg conversion failed: {e.stderr}")
+    except FileNotFoundError:
+        raise RuntimeError("FFmpeg not found. Please install FFmpeg and ensure it's in your PATH")
 
 
 def replace_audio_in_video(video_path, original_audio_path, output_path):
@@ -65,7 +124,7 @@ def replace_audio_in_video(video_path, original_audio_path, output_path):
     print(f"Final output: {output_path}")
 
     try:
-        subprocess.run([
+        result = subprocess.run([
             'ffmpeg',
             '-i', video_path,           # Input video (with lip-sync)
             '-i', original_audio_path,  # Original high-quality audio
@@ -77,10 +136,12 @@ def replace_audio_in_video(video_path, original_audio_path, output_path):
             '-shortest',                # Match duration to shortest stream
             '-y',                       # Overwrite output file
             output_path
-        ], check=True, capture_output=True)
+        ], check=True, capture_output=True, text=True)
         print(f"Audio replacement completed: {output_path}")
     except subprocess.CalledProcessError as e:
-        raise RuntimeError(f"FFmpeg audio replacement failed: {e.stderr.decode()}")
+        print(f"FFmpeg stderr: {e.stderr}")
+        print(f"FFmpeg stdout: {e.stdout}")
+        raise RuntimeError(f"FFmpeg audio replacement failed: {e.stderr}")
 
 
 def main_inference(video_path, audio_wav_path, temp_output_path):
@@ -206,6 +267,10 @@ def main():
     os.makedirs(temp_dir, exist_ok=True)
     print(f"Using temporary directory: {temp_dir}")
 
+    # Test URLs accessibility
+    print(f"Video URL: {args.video_url}")
+    print(f"Audio URL: {args.audio_url}")
+
     video_path = None
     original_audio_path = None
     audio_wav_path = None
@@ -213,8 +278,14 @@ def main():
 
     try:
         # Download video and audio files
-        print("Downloading video and audio files...")
+        print("=" * 50)
+        print("DOWNLOADING FILES")
+        print("=" * 50)
+
+        print("Downloading video...")
         video_path = download_file(args.video_url, temp_dir)
+
+        print("Downloading audio...")
         original_audio_path = download_file(args.audio_url, temp_dir)
 
         # Verify files were downloaded successfully
@@ -223,8 +294,9 @@ def main():
         if not os.path.exists(original_audio_path):
             raise RuntimeError(f"Failed to download audio from {args.audio_url}")
 
-        print(f"Video downloaded: {video_path} (size: {os.path.getsize(video_path)} bytes)")
-        print(f"Audio downloaded: {original_audio_path} (size: {os.path.getsize(original_audio_path)} bytes)")
+        print(f"\nDownload Summary:")
+        print(f"Video: {video_path} ({os.path.getsize(video_path)} bytes)")
+        print(f"Audio: {original_audio_path} ({os.path.getsize(original_audio_path)} bytes)")
 
         # Convert audio to WAV for inference if needed
         audio_wav_path = os.path.join(temp_dir, "audio_for_inference.wav")
@@ -242,15 +314,19 @@ def main():
         temp_output_path = os.path.abspath(temp_output_path)
 
         # Run main inference
-        print("Running lip-sync inference...")
+        print("\n" + "=" * 50)
+        print("RUNNING LIP-SYNC INFERENCE")
+        print("=" * 50)
         main_inference(video_path, audio_wav_path, temp_output_path)
 
         # Replace audio with original high-quality audio
-        print("Replacing with original high-quality audio...")
+        print("\n" + "=" * 50)
+        print("REPLACING WITH ORIGINAL AUDIO")
+        print("=" * 50)
         output_path = os.path.abspath(args.output_path)
         replace_audio_in_video(temp_output_path, original_audio_path, output_path)
 
-        print(f"Process completed successfully! Final output: {output_path}")
+        print(f"\nProcess completed successfully! Final output: {output_path}")
 
         # Only cleanup on success
         print("Cleaning up temporary files...")
@@ -271,12 +347,12 @@ def main():
         return 0
 
     except Exception as e:
-        print(f"Error: {e}")
+        print(f"\nError: {e}")
         print(f"Temporary files preserved for debugging in: {temp_dir}")
 
         # Print debug info about existing files
         if os.path.exists(temp_dir):
-            print("Files in temp directory:")
+            print("\nFiles in temp directory:")
             for f in os.listdir(temp_dir):
                 f_path = os.path.join(temp_dir, f)
                 if os.path.isfile(f_path):
