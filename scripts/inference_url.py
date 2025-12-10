@@ -247,7 +247,7 @@ def main_inference(video_path, audio_wav_path, temp_output_path):
         width=config.data.resolution,
         height=config.data.resolution,
         mask_image_path=config.data.mask_image_path,
-        temp_dir=temp_dir,
+        temp_dir= temp_dir/ 'ltsync',
     )
 
     print(f"Lip-sync inference completed. Temporary output saved to: {temp_output_path}")
