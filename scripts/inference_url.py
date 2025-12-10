@@ -162,6 +162,7 @@ def main_inference(video_path, audio_wav_path, temp_output_path):
     print(f"Lip-sync inference completed. Temporary output saved to: {temp_output_path}")
 
 
+
 def main():
     parser = argparse.ArgumentParser(description="LatentSync inference with URL inputs")
     parser.add_argument("--video_url", type=str, required=True, help="URL of the input video")
@@ -174,11 +175,25 @@ def main():
     # Create temporary directory
     os.makedirs(args.temp_dir, exist_ok=True)
 
+    video_path = None
+    original_audio_path = None
+    audio_wav_path = None
+    temp_output_path = None
+
     try:
         # Download video and audio files
         print("Downloading video and audio files...")
         video_path = download_file(args.video_url, args.temp_dir)
         original_audio_path = download_file(args.audio_url, args.temp_dir)
+
+        # Verify files were downloaded successfully
+        if not os.path.exists(video_path):
+            raise RuntimeError(f"Failed to download video from {args.video_url}")
+        if not os.path.exists(original_audio_path):
+            raise RuntimeError(f"Failed to download audio from {args.audio_url}")
+
+        print(f"Video downloaded: {video_path} (size: {os.path.getsize(video_path)} bytes)")
+        print(f"Audio downloaded: {original_audio_path} (size: {os.path.getsize(original_audio_path)} bytes)")
 
         # Convert audio to WAV for inference if needed
         audio_wav_path = os.path.join(args.temp_dir, "audio_for_inference.wav")
@@ -203,22 +218,32 @@ def main():
 
         print(f"Process completed successfully! Final output: {args.output_path}")
 
+        # Only cleanup on success
+        print("Cleaning up temporary files...")
+        cleanup_files = [video_path, original_audio_path]
+        if audio_wav_path != original_audio_path:  # Don't delete twice if same file
+            cleanup_files.append(audio_wav_path)
+        if temp_output_path and os.path.exists(temp_output_path):
+            cleanup_files.append(temp_output_path)
+
+        for file_path in cleanup_files:
+            try:
+                if file_path and os.path.exists(file_path):
+                    os.unlink(file_path)
+                    print(f"Deleted: {file_path}")
+            except Exception as e:
+                print(f"Warning: Could not delete {file_path}: {e}")
+
+        return 0
+
     except Exception as e:
         print(f"Error: {e}")
+        print("Temporary files preserved for debugging in:", args.temp_dir)
         return 1
 
-    finally:
-        # Cleanup temporary files (optional)
-        print("Cleaning up temporary files...")
-        for file in os.listdir(args.temp_dir):
-            file_path = os.path.join(args.temp_dir, file)
-            try:
-                if os.path.isfile(file_path):
-                    os.unlink(file_path)
-            except Exception as e:
-                print(f"Error deleting {file_path}: {e}")
 
-    return 0
+if __name__ == "__main__":
+    exit(main())
 
 
 if __name__ == "__main__":
