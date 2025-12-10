@@ -1,3 +1,4 @@
+
 #!/usr/bin/env python3
 
 import argparse
@@ -24,6 +25,8 @@ def download_file(url, temp_dir):
         filename = "downloaded_file"
 
     filepath = os.path.join(temp_dir, filename)
+    # Convert to absolute path
+    filepath = os.path.abspath(filepath)
     print(f"Downloading {url} to {filepath}")
     urllib.request.urlretrieve(url, filepath)
     return filepath
@@ -31,6 +34,10 @@ def download_file(url, temp_dir):
 
 def convert_audio_to_wav(input_path, output_path):
     """Convert audio file to WAV format using ffmpeg"""
+    # Use absolute paths
+    input_path = os.path.abspath(input_path)
+    output_path = os.path.abspath(output_path)
+
     print(f"Converting audio {input_path} to WAV format: {output_path}")
 
     try:
@@ -49,6 +56,11 @@ def convert_audio_to_wav(input_path, output_path):
 
 def replace_audio_in_video(video_path, original_audio_path, output_path):
     """Replace audio in video with original high-quality audio using ffmpeg"""
+    # Use absolute paths
+    video_path = os.path.abspath(video_path)
+    original_audio_path = os.path.abspath(original_audio_path)
+    output_path = os.path.abspath(output_path)
+
     print(f"Replacing audio in {video_path} with original audio from {original_audio_path}")
     print(f"Final output: {output_path}")
 
@@ -74,6 +86,11 @@ def replace_audio_in_video(video_path, original_audio_path, output_path):
 def main_inference(video_path, audio_wav_path, temp_output_path):
     """Main inference method with hardcoded config paths"""
 
+    # Convert all paths to absolute paths
+    video_path = os.path.abspath(video_path)
+    audio_wav_path = os.path.abspath(audio_wav_path)
+    temp_output_path = os.path.abspath(temp_output_path)
+
     # Hardcoded configuration paths
     unet_config_path = "configs/unet/stage2_512.yaml"
     inference_ckpt_path = "checkpoints/latentsync_unet.pt"
@@ -81,20 +98,29 @@ def main_inference(video_path, audio_wav_path, temp_output_path):
     # Load configuration
     config = OmegaConf.load(unet_config_path)
 
-    # Check input files exist
-    if not os.path.exists(video_path):
+    # Check input files exist with detailed info
+    print(f"Checking video file: {video_path}")
+    print(f"Video file exists: {os.path.exists(video_path)}")
+    if os.path.exists(video_path):
+        print(f"Video file size: {os.path.getsize(video_path)} bytes")
+    else:
         raise RuntimeError(f"Video path '{video_path}' not found")
-    if not os.path.exists(audio_wav_path):
+
+    print(f"Checking audio file: {audio_wav_path}")
+    print(f"Audio file exists: {os.path.exists(audio_wav_path)}")
+    if os.path.exists(audio_wav_path):
+        print(f"Audio file size: {os.path.getsize(audio_wav_path)} bytes")
+    else:
         raise RuntimeError(f"Audio path '{audio_wav_path}' not found")
 
     # Check if the GPU supports float16
     is_fp16_supported = torch.cuda.is_available() and torch.cuda.get_device_capability()[0] > 7
     dtype = torch.float16 if is_fp16_supported else torch.float32
 
-    print(f"Input video path: {video_path}")
-    print(f"Input audio path: {audio_wav_path}")
+    print(f"Input video path (absolute): {video_path}")
+    print(f"Input audio path (absolute): {audio_wav_path}")
     print(f"Loaded checkpoint path: {inference_ckpt_path}")
-    print(f"Temporary output path: {temp_output_path}")
+    print(f"Temporary output path (absolute): {temp_output_path}")
 
     scheduler = DDIMScheduler.from_pretrained("configs")
 
@@ -144,7 +170,11 @@ def main_inference(video_path, audio_wav_path, temp_output_path):
 
     print(f"Initial seed: {torch.initial_seed()}")
 
-    # Run the pipeline
+    # Double-check files exist right before pipeline call
+    print(f"Final check - Video exists: {os.path.exists(video_path)}")
+    print(f"Final check - Audio exists: {os.path.exists(audio_wav_path)}")
+
+    # Run the pipeline with absolute paths
     pipeline(
         video_path=video_path,
         audio_path=audio_wav_path,
@@ -162,7 +192,6 @@ def main_inference(video_path, audio_wav_path, temp_output_path):
     print(f"Lip-sync inference completed. Temporary output saved to: {temp_output_path}")
 
 
-
 def main():
     parser = argparse.ArgumentParser(description="LatentSync inference with URL inputs")
     parser.add_argument("--video_url", type=str, required=True, help="URL of the input video")
@@ -172,8 +201,10 @@ def main():
 
     args = parser.parse_args()
 
-    # Create temporary directory
-    os.makedirs(args.temp_dir, exist_ok=True)
+    # Create temporary directory with absolute path
+    temp_dir = os.path.abspath(args.temp_dir)
+    os.makedirs(temp_dir, exist_ok=True)
+    print(f"Using temporary directory: {temp_dir}")
 
     video_path = None
     original_audio_path = None
@@ -183,8 +214,8 @@ def main():
     try:
         # Download video and audio files
         print("Downloading video and audio files...")
-        video_path = download_file(args.video_url, args.temp_dir)
-        original_audio_path = download_file(args.audio_url, args.temp_dir)
+        video_path = download_file(args.video_url, temp_dir)
+        original_audio_path = download_file(args.audio_url, temp_dir)
 
         # Verify files were downloaded successfully
         if not os.path.exists(video_path):
@@ -196,7 +227,8 @@ def main():
         print(f"Audio downloaded: {original_audio_path} (size: {os.path.getsize(original_audio_path)} bytes)")
 
         # Convert audio to WAV for inference if needed
-        audio_wav_path = os.path.join(args.temp_dir, "audio_for_inference.wav")
+        audio_wav_path = os.path.join(temp_dir, "audio_for_inference.wav")
+        audio_wav_path = os.path.abspath(audio_wav_path)
 
         # Check if audio is already in WAV format
         if original_audio_path.lower().endswith('.wav'):
@@ -206,7 +238,8 @@ def main():
             convert_audio_to_wav(original_audio_path, audio_wav_path)
 
         # Create temporary output path for lip-sync video (without final audio)
-        temp_output_path = os.path.join(args.temp_dir, "lipsync_output_temp.mp4")
+        temp_output_path = os.path.join(temp_dir, "lipsync_output_temp.mp4")
+        temp_output_path = os.path.abspath(temp_output_path)
 
         # Run main inference
         print("Running lip-sync inference...")
@@ -214,9 +247,10 @@ def main():
 
         # Replace audio with original high-quality audio
         print("Replacing with original high-quality audio...")
-        replace_audio_in_video(temp_output_path, original_audio_path, args.output_path)
+        output_path = os.path.abspath(args.output_path)
+        replace_audio_in_video(temp_output_path, original_audio_path, output_path)
 
-        print(f"Process completed successfully! Final output: {args.output_path}")
+        print(f"Process completed successfully! Final output: {output_path}")
 
         # Only cleanup on success
         print("Cleaning up temporary files...")
@@ -238,12 +272,17 @@ def main():
 
     except Exception as e:
         print(f"Error: {e}")
-        print("Temporary files preserved for debugging in:", args.temp_dir)
+        print(f"Temporary files preserved for debugging in: {temp_dir}")
+
+        # Print debug info about existing files
+        if os.path.exists(temp_dir):
+            print("Files in temp directory:")
+            for f in os.listdir(temp_dir):
+                f_path = os.path.join(temp_dir, f)
+                if os.path.isfile(f_path):
+                    print(f"  - {f} ({os.path.getsize(f_path)} bytes)")
+
         return 1
-
-
-if __name__ == "__main__":
-    exit(main())
 
 
 if __name__ == "__main__":
