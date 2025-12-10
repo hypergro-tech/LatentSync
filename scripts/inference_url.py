@@ -278,25 +278,22 @@ def match_video_audio_duration(video_path, audio_path, temp_dir, strategy='exten
         processed_audio = add_silence_to_audio(audio_path, video_duration, temp_dir, 'end')
         return video_path, processed_audio
 
-    elif strategy == 'trim':
-        # Trim both to shorter duration
-        target_duration = min(video_duration, audio_duration)
-        print(f"Trimming both to {target_duration:.2f}s")
+    # Trim both to shorter duration
+    target_duration = min(video_duration, audio_duration)
+    print(f"Trimming both to {target_duration:.2f}s")
 
-        processed_video = video_path
-        processed_audio = audio_path
+    processed_video = video_path
+    processed_audio = audio_path
 
-        if video_duration > target_duration:
-            processed_video = trim_media(video_path, target_duration, temp_dir, 'video')
+    if video_duration > target_duration:
+        processed_video = trim_media(video_path, target_duration, temp_dir, 'video')
 
-        if audio_duration > target_duration:
-            processed_audio = trim_media(audio_path, target_duration, temp_dir, 'audio')
+    if audio_duration > target_duration:
+        processed_audio = trim_media(audio_path, target_duration, temp_dir, 'audio')
 
-        return processed_video, processed_audio
+    return processed_video, processed_audio
 
-    else:
-        print("No duration matching applied with current strategy")
-        return video_path, audio_path
+
 
 
 def convert_video_fps(video_path, target_fps, temp_dir):
