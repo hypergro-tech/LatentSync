@@ -1,4 +1,3 @@
-
 #!/usr/bin/env python3
 
 import argparse
@@ -144,7 +143,7 @@ def replace_audio_in_video(video_path, original_audio_path, output_path):
         raise RuntimeError(f"FFmpeg audio replacement failed: {e.stderr}")
 
 
-def main_inference(video_path, audio_wav_path, temp_output_path):
+def main_inference(video_path, audio_wav_path, temp_output_path, download_temp_dir):
     """Main inference method with hardcoded config paths"""
 
     # Convert all paths to absolute paths
@@ -222,7 +221,10 @@ def main_inference(video_path, audio_wav_path, temp_output_path):
     inference_steps = 20
     guidance_scale = 1.5
     seed = 1247
-    temp_dir = "temp"
+
+    # Create separate temp dir for pipeline processing (not where downloads are stored)
+    pipeline_temp_dir = os.path.join(download_temp_dir, "pipeline_temp")
+    os.makedirs(pipeline_temp_dir, exist_ok=True)
 
     if seed != -1:
         set_seed(seed)
@@ -230,12 +232,13 @@ def main_inference(video_path, audio_wav_path, temp_output_path):
         torch.seed()
 
     print(f"Initial seed: {torch.initial_seed()}")
+    print(f"Pipeline temp dir: {pipeline_temp_dir}")
 
     # Double-check files exist right before pipeline call
     print(f"Final check - Video exists: {os.path.exists(video_path)}")
     print(f"Final check - Audio exists: {os.path.exists(audio_wav_path)}")
 
-    # Run the pipeline with absolute paths
+    # Run the pipeline with separate temp directory
     pipeline(
         video_path=video_path,
         audio_path=audio_wav_path,
@@ -247,7 +250,7 @@ def main_inference(video_path, audio_wav_path, temp_output_path):
         width=config.data.resolution,
         height=config.data.resolution,
         mask_image_path=config.data.mask_image_path,
-        temp_dir= f"{temp_dir}/ltsync",
+        temp_dir=pipeline_temp_dir,  # Use separate temp dir for pipeline
     )
 
     print(f"Lip-sync inference completed. Temporary output saved to: {temp_output_path}")
@@ -258,7 +261,7 @@ def main():
     parser.add_argument("--video_url", type=str, required=True, help="URL of the input video")
     parser.add_argument("--audio_url", type=str, required=True, help="URL of the input audio")
     parser.add_argument("--output_path", type=str, required=True, help="Path for output video")
-    parser.add_argument("--temp_dir", type=str, default="temp", help="Temporary directory for downloads")
+    parser.add_argument("--temp_dir", type=str, default="temp1", help="Temporary directory for downloads")
 
     args = parser.parse_args()
 
@@ -313,11 +316,17 @@ def main():
         temp_output_path = os.path.join(temp_dir, "lipsync_output_temp.mp4")
         temp_output_path = os.path.abspath(temp_output_path)
 
-        # Run main inference
+        # Run main inference - pass the download temp dir so pipeline can create its own subdir
         print("\n" + "=" * 50)
         print("RUNNING LIP-SYNC INFERENCE")
         print("=" * 50)
-        main_inference(video_path, audio_wav_path, temp_output_path)
+        main_inference(video_path, audio_wav_path, temp_output_path, temp_dir)
+
+        # Verify inference output exists
+        if not os.path.exists(temp_output_path):
+            raise RuntimeError(f"Inference failed - output file not created: {temp_output_path}")
+
+        print(f"Inference output size: {os.path.getsize(temp_output_path)} bytes")
 
         # Replace audio with original high-quality audio
         print("\n" + "=" * 50)
@@ -330,19 +339,15 @@ def main():
 
         # Only cleanup on success
         print("Cleaning up temporary files...")
-        cleanup_files = [video_path, original_audio_path]
-        if audio_wav_path != original_audio_path:  # Don't delete twice if same file
-            cleanup_files.append(audio_wav_path)
-        if temp_output_path and os.path.exists(temp_output_path):
-            cleanup_files.append(temp_output_path)
 
-        for file_path in cleanup_files:
+        # Clean up the entire temp directory
+        import shutil
+        if os.path.exists(temp_dir):
             try:
-                if file_path and os.path.exists(file_path):
-                    os.unlink(file_path)
-                    print(f"Deleted: {file_path}")
+                shutil.rmtree(temp_dir)
+                print(f"Cleaned up temp directory: {temp_dir}")
             except Exception as e:
-                print(f"Warning: Could not delete {file_path}: {e}")
+                print(f"Warning: Could not clean up temp directory {temp_dir}: {e}")
 
         return 0
 
@@ -353,10 +358,18 @@ def main():
         # Print debug info about existing files
         if os.path.exists(temp_dir):
             print("\nFiles in temp directory:")
-            for f in os.listdir(temp_dir):
-                f_path = os.path.join(temp_dir, f)
-                if os.path.isfile(f_path):
-                    print(f"  - {f} ({os.path.getsize(f_path)} bytes)")
+            try:
+                for root, dirs, files in os.walk(temp_dir):
+                    level = root.replace(temp_dir, '').count(os.sep)
+                    indent = ' ' * 2 * level
+                    print(f"{indent}{os.path.basename(root)}/")
+                    subindent = ' ' * 2 * (level + 1)
+                    for file in files:
+                        file_path = os.path.join(root, file)
+                        if os.path.isfile(file_path):
+                            print(f"{subindent}{file} ({os.path.getsize(file_path)} bytes)")
+            except Exception as walk_error:
+                print(f"Error walking directory: {walk_error}")
 
         return 1
 
