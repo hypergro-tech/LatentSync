@@ -4,33 +4,16 @@
 import argparse
 import os
 import subprocess
-import tempfile
 import urllib.request
 import urllib.error
-from pathlib import Path
-from omegaconf import OmegaConf
-import torch
-import torchaudio
-import cv2
-import ffmpeg
-from diffusers import AutoencoderKL, DDIMScheduler
-from latentsync.models.unet import UNet3DConditionModel
-from latentsync.pipelines.lipsync_pipeline import LipsyncPipeline
-from accelerate.utils import set_seed
-from latentsync.whisper.audio2feature import Audio2Feature
-from DeepCache import DeepCacheSDHelper
 from datetime import datetime
-from enum import Enum
-from typing import Tuple
 import logging
+import sys
+import shutil
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-
-class SilenceLocation(Enum):
-    START = 'start'
-    END = 'end'
 
 
 def download_file(url, temp_dir):
@@ -102,430 +85,432 @@ def download_file(url, temp_dir):
         raise RuntimeError(f"Download failed for {url}: {str(e)}")
 
 
+def run_ffmpeg_command(cmd, description="FFmpeg operation"):
+    """Run FFmpeg command with error handling"""
+    try:
+        print(f"Running {description}...")
+        result = subprocess.run(cmd, check=True, capture_output=True, text=True)
+        print(f"{description} completed successfully")
+        return result
+    except subprocess.CalledProcessError as e:
+        print(f"{description} failed:")
+        print(f"Command: {' '.join(cmd)}")
+        print(f"Error: {e.stderr}")
+        raise RuntimeError(f"{description} failed: {e.stderr}")
+    except FileNotFoundError:
+        raise RuntimeError("FFmpeg not found. Please install FFmpeg and ensure it's in your PATH")
+
+
 def convert_audio_to_wav(input_path, output_path):
     """Convert audio file to WAV format using ffmpeg"""
     input_path = os.path.abspath(input_path)
     output_path = os.path.abspath(output_path)
 
-    print(f"Converting audio {input_path} to WAV format: {output_path}")
-
-    try:
-        result = subprocess.run([
-            'ffmpeg', '-i', input_path,
-            '-ar', '16000',  # Sample rate for whisper
-            '-ac', '1',      # Mono channel
-            '-f', 'wav',
-            '-y',            # Overwrite output file
-            output_path
-        ], check=True, capture_output=True, text=True)
-        print(f"Audio conversion completed: {output_path}")
-    except subprocess.CalledProcessError as e:
-        print(f"FFmpeg stderr: {e.stderr}")
-        print(f"FFmpeg stdout: {e.stdout}")
-        raise RuntimeError(f"FFmpeg conversion failed: {e.stderr}")
-    except FileNotFoundError:
-        raise RuntimeError("FFmpeg not found. Please install FFmpeg and ensure it's in your PATH")
-
-
-def get_video_duration(video_path):
-    """Get video duration using ffmpeg"""
-    if not os.path.exists(video_path):
-        return 0
-
-    try:
-        probe = ffmpeg.probe(video_path, v='error', select_streams='v:0',
-                             show_entries='format=duration')
-        return float(probe['format']['duration'])
-    except Exception as e:
-        logger.warning(f"Could not get duration for {video_path}: {e}")
-        return 0
-
-
-def has_audio(video_path):
-    """Check if video has audio stream"""
-    if not os.path.exists(video_path):
-        return False
-
-    try:
-        probe = ffmpeg.probe(video_path, v='error', select_streams='a')
-        return len(probe.get('streams', [])) > 0
-    except Exception as e:
-        logger.warning(f"Could not detect audio in {video_path}: {e}")
-        return False
-
-
-def reverse_video(video_path, temp_directory_path):
-    """Reverse video with or without audio"""
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    reversed_path = f"{temp_directory_path}/reversed_{timestamp}.mp4"
-    audio_exists = has_audio(video_path)
-
-    try:
-        if audio_exists:
-            ffmpeg.input(video_path).output(
-                reversed_path, vf='reverse', af='areverse',
-                **{'c:v': 'libx264', 'preset': 'fast', 'crf': '23'}
-            ).run(overwrite_output=True, quiet=True)
-        else:
-            ffmpeg.input(video_path).output(
-                reversed_path, vf='reverse',
-                **{'c:v': 'libx264', 'preset': 'fast', 'crf': '23'}
-            ).run(overwrite_output=True, quiet=True)
-    except ffmpeg.Error as e:
-        logger.error(f"Video reversal failed: {e}")
-        return video_path
-
-    return reversed_path
-
-
-def extend_video(video_path, target_duration, temp_directory_path, loop_from_end=True):
-    """Extend video duration by looping"""
-    original_duration = get_video_duration(video_path)
-    if original_duration >= target_duration:
-        return video_path
-
-    audio_exists = has_audio(video_path)
-    clips = [video_path]
-    total_duration = original_duration
-
-    try:
-        while total_duration < target_duration:
-            if loop_from_end:
-                reversed_clip = reverse_video(clips[-1], temp_directory_path)
-                if reversed_clip != clips[-1]:  # Only add if reversal was successful
-                    clips.append(reversed_clip)
-                else:
-                    break
-            else:
-                clips.append(clips[0])  # Use original instead of last
-            total_duration += original_duration
-
-        if len(clips) <= 1:
-            return video_path
-
-        # Create extended video
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        extended_video_path = f"{temp_directory_path}/extended_{timestamp}.mp4"
-
-        # Use ffmpeg-python for concatenation
-        inputs = [ffmpeg.input(clip) for clip in clips]
-        ffmpeg.concat(*inputs, v=1, a=1 if audio_exists else 0).output(
-            extended_video_path,
-            **{'c:v': 'libx264', 'preset': 'fast', 'crf': '23'}
-        ).run(overwrite_output=True, quiet=True)
-
-        return extended_video_path
-
-    except Exception as e:
-        logger.error(f"Video extension failed: {e}")
-        return video_path
-
-
-def trim_video(video_path, target_duration, temp_directory_path):
-    """Trim video to target duration"""
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    trimmed_path = f"{temp_directory_path}/trimmed_{timestamp}.mp4"
-
-    try:
-        ffmpeg.input(video_path, ss=0, to=target_duration).output(
-            trimmed_path,
-            **{'c:v': 'libx264', 'preset': 'fast', 'crf': '23', 'c:a': 'aac'}
-        ).run(overwrite_output=True, quiet=True)
-        return trimmed_path
-    except ffmpeg.Error as e:
-        logger.error(f"Video trimming failed: {e}")
-        return video_path
-
-
-def add_silence_to_audio(audio_path, temp_directory_path, silence_location=SilenceLocation.END, silence_duration=1.0):
-    """Add silence to audio at start or end"""
-    waveform, sample_rate = torchaudio.load(audio_path)
-
-    # Ensure float32 for better quality
-    if waveform.dtype != torch.float32:
-        waveform = waveform.float()
-
-    silence_samples = int(silence_duration * sample_rate)
-    silence = torch.zeros((waveform.shape[0], silence_samples), dtype=waveform.dtype)
-
-    if silence_location == SilenceLocation.START:
-        modified_waveform = torch.cat((silence, waveform), dim=1)
-        suffix = "silence_start"
-    else:
-        modified_waveform = torch.cat((waveform, silence), dim=1)
-        suffix = "silence_end"
-
-    input_name = os.path.splitext(os.path.basename(audio_path))[0]
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_path = f"{temp_directory_path}/{input_name}_{suffix}_{timestamp}.wav"
-
-    torchaudio.save(output_path, modified_waveform, sample_rate)
-    return output_path
-
-
-def pad_audio_to_multiple_of_16(audio_path, temp_directory_path, target_fps=25):
-    """Pad audio duration to multiple of 16 frames"""
-    waveform, sample_rate = torchaudio.load(audio_path)
-
-    # Use float32 for audio processing to maintain quality
-    if waveform.dtype != torch.float32:
-        waveform = waveform.float()
-
-    audio_duration = waveform.shape[1] / sample_rate
-    num_frames = int(audio_duration * target_fps)
-    remainder = num_frames % 16
-
-    if remainder > 0:
-        pad_frames = 16 - remainder
-        pad_samples = int((pad_frames / target_fps) * sample_rate)
-
-        # More memory efficient padding
-        padded_waveform = torch.nn.functional.pad(waveform, (0, pad_samples))
-
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        padded_audio_path = f"{temp_directory_path}/padded_audio_{timestamp}.wav"
-        torchaudio.save(padded_audio_path, padded_waveform, sample_rate)
-
-        final_num_frames = int((padded_waveform.shape[1] / sample_rate) * target_fps)
-        return padded_audio_path, final_num_frames
-    else:
-        final_num_frames = num_frames
-        return audio_path, final_num_frames
-
-
-def convert_video_fps(input_path, target_fps, temp_directory_path, prefix="converted"):
-    """Convert video FPS with optimized ffmpeg settings"""
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_path = f"{temp_directory_path}/{prefix}_{target_fps}fps_{timestamp}.mp4"
-
     cmd = [
-        "ffmpeg", "-y", "-i", input_path,
-        "-filter:v", f"fps={target_fps}",
-        "-c:v", "libx264", "-preset", "medium", "-crf", "23",
-        "-pix_fmt", "yuv420p", "-movflags", "+faststart",
+        'ffmpeg', '-y', '-i', input_path,
+        '-ar', '16000',  # Sample rate for whisper
+        '-ac', '1',      # Mono channel
+        '-c:a', 'pcm_s16le',  # PCM 16-bit for compatibility
+        '-f', 'wav',
         output_path
     ]
 
+    run_ffmpeg_command(cmd, f"Converting audio to WAV: {os.path.basename(input_path)}")
+    return output_path
+
+
+def get_media_info(media_path):
+    """Get media duration and other info using ffprobe"""
     try:
-        subprocess.run(cmd, check=True, capture_output=True)
-        return output_path
-    except subprocess.CalledProcessError as e:
-        logger.error(f"FFmpeg conversion failed: {e.stderr}")
+        # Get duration
+        duration_cmd = [
+            'ffprobe', '-v', 'quiet', '-show_entries', 'format=duration',
+            '-of', 'default=noprint_wrappers=1:nokey=1', media_path
+        ]
+        duration_result = subprocess.run(duration_cmd, capture_output=True, text=True, check=True)
+        duration = float(duration_result.stdout.strip())
+
+        # Check for audio stream
+        audio_cmd = [
+            'ffprobe', '-v', 'quiet', '-select_streams', 'a',
+            '-show_entries', 'stream=index', '-of', 'csv=p=0', media_path
+        ]
+        audio_result = subprocess.run(audio_cmd, capture_output=True, text=True)
+        has_audio = bool(audio_result.stdout.strip())
+
+        return {
+            'duration': duration,
+            'has_audio': has_audio,
+            'path': media_path
+        }
+
+    except (subprocess.CalledProcessError, ValueError) as e:
+        logger.warning(f"Could not get info for {media_path}: {e}")
+        return {'duration': 0, 'has_audio': False, 'path': media_path}
+
+
+def create_looped_video(video_path, target_duration, temp_dir):
+    """Create a looped version of video to match target duration"""
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_path = f"{temp_dir}/looped_video_{timestamp}.mp4"
+
+    cmd = [
+        'ffmpeg', '-y',
+        '-stream_loop', '-1',  # Loop indefinitely
+        '-i', video_path,
+        '-t', str(target_duration),  # Stop at target duration
+        '-c:v', 'libx264',
+        '-preset', 'fast',
+        '-crf', '23',
+        '-pix_fmt', 'yuv420p',
+        output_path
+    ]
+
+    run_ffmpeg_command(cmd, f"Creating looped video for {target_duration:.2f}s")
+    return output_path
+
+
+def add_silence_to_audio(audio_path, target_duration, temp_dir, location='end'):
+    """Add silence to audio to match target duration"""
+    audio_info = get_media_info(audio_path)
+    current_duration = audio_info['duration']
+
+    if current_duration >= target_duration:
+        return audio_path
+
+    silence_duration = target_duration - current_duration
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_path = f"{temp_dir}/padded_audio_{timestamp}.wav"
+
+    if location == 'start':
+        # Add silence at start
+        cmd = [
+            'ffmpeg', '-y',
+            '-f', 'lavfi', '-i', f'anullsrc=duration={silence_duration}:sample_rate=16000:channel_layout=mono',
+            '-i', audio_path,
+            '-filter_complex', '[0:a][1:a]concat=n=2:v=0:a=1[out]',
+            '-map', '[out]',
+            output_path
+        ]
+    else:
+        # Add silence at end
+        cmd = [
+            'ffmpeg', '-y',
+            '-i', audio_path,
+            '-f', 'lavfi', '-i', f'anullsrc=duration={silence_duration}:sample_rate=16000:channel_layout=mono',
+            '-filter_complex', '[0:a][1:a]concat=n=2:v=0:a=1[out]',
+            '-map', '[out]',
+            output_path
+        ]
+
+    run_ffmpeg_command(cmd, f"Adding {silence_duration:.2f}s silence to audio ({location})")
+    return output_path
+
+
+def trim_media(media_path, target_duration, temp_dir, media_type='video'):
+    """Trim media to target duration"""
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    extension = '.mp4' if media_type == 'video' else '.wav'
+    output_path = f"{temp_dir}/trimmed_{media_type}_{timestamp}{extension}"
+
+    cmd = [
+        'ffmpeg', '-y',
+        '-i', media_path,
+        '-t', str(target_duration),
+        '-c', 'copy' if media_type == 'video' else 'pcm_s16le',
+        output_path
+    ]
+
+    run_ffmpeg_command(cmd, f"Trimming {media_type} to {target_duration:.2f}s")
+    return output_path
+
+
+def pad_audio_for_inference(audio_path, temp_dir, target_fps=25):
+    """Pad audio duration to be multiple of 16 frames for model compatibility"""
+    audio_info = get_media_info(audio_path)
+    duration = audio_info['duration']
+
+    # Calculate frames and check if padding needed
+    num_frames = int(duration * target_fps)
+    remainder = num_frames % 16
+
+    if remainder == 0:
+        print(f"Audio already has {num_frames} frames (multiple of 16)")
+        return audio_path, num_frames
+
+    # Calculate required padding
+    pad_frames = 16 - remainder
+    pad_duration = pad_frames / target_fps
+    new_duration = duration + pad_duration
+
+    print(f"Padding audio: {num_frames} -> {num_frames + pad_frames} frames (+{pad_duration:.3f}s)")
+
+    padded_audio = add_silence_to_audio(audio_path, new_duration, temp_dir, 'end')
+    final_frames = num_frames + pad_frames
+
+    return padded_audio, final_frames
+
+
+def match_video_audio_duration(video_path, audio_path, temp_dir, strategy='extend_video'):
+    """Match video and audio durations using specified strategy"""
+    video_info = get_media_info(video_path)
+    audio_info = get_media_info(audio_path)
+
+    video_duration = video_info['duration']
+    audio_duration = audio_info['duration']
+
+    print(f"Video duration: {video_duration:.2f}s")
+    print(f"Audio duration: {audio_duration:.2f}s")
+    print(f"Difference: {abs(video_duration - audio_duration):.2f}s")
+
+    # If durations are very close, don't modify
+    if abs(video_duration - audio_duration) < 0.1:
+        print("Durations are already very close, no modification needed")
+        return video_path, audio_path
+
+    if strategy == 'extend_video' and audio_duration > video_duration:
+        print(f"Extending video to match audio duration ({audio_duration:.2f}s)")
+        processed_video = create_looped_video(video_path, audio_duration, temp_dir)
+        return processed_video, audio_path
+
+    elif strategy == 'add_silence' and video_duration > audio_duration:
+        print(f"Adding silence to audio to match video duration ({video_duration:.2f}s)")
+        processed_audio = add_silence_to_audio(audio_path, video_duration, temp_dir, 'end')
+        return video_path, processed_audio
+
+    elif strategy == 'trim':
+        # Trim both to shorter duration
+        target_duration = min(video_duration, audio_duration)
+        print(f"Trimming both to {target_duration:.2f}s")
+
+        processed_video = video_path
+        processed_audio = audio_path
+
+        if video_duration > target_duration:
+            processed_video = trim_media(video_path, target_duration, temp_dir, 'video')
+
+        if audio_duration > target_duration:
+            processed_audio = trim_media(audio_path, target_duration, temp_dir, 'audio')
+
+        return processed_video, processed_audio
+
+    else:
+        print("No duration matching applied with current strategy")
+        return video_path, audio_path
+
+
+def convert_video_fps(video_path, target_fps, temp_dir):
+    """Convert video to target FPS"""
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_path = f"{temp_dir}/fps_converted_{target_fps}_{timestamp}.mp4"
+
+    cmd = [
+        'ffmpeg', '-y',
+        '-i', video_path,
+        '-filter:v', f'fps={target_fps}',
+        '-c:v', 'libx264',
+        '-preset', 'medium',
+        '-crf', '23',
+        '-pix_fmt', 'yuv420p',
+        '-movflags', '+faststart',
+        output_path
+    ]
+
+    run_ffmpeg_command(cmd, f"Converting video to {target_fps} FPS")
+    return output_path
+
+
+def run_latentsync_inference(video_path, audio_path, temp_dir):
+    """Run the actual LatentSync inference"""
+    try:
+        print("Attempting to load LatentSync models...")
+
+        # Try to import required modules
+        from pathlib import Path
+        from omegaconf import OmegaConf
+        import torch
+        from diffusers import AutoencoderKL, DDIMScheduler
+        from latentsync.models.unet import UNet3DConditionModel
+        from latentsync.pipelines.lipsync_pipeline import LipsyncPipeline
+        from accelerate.utils import set_seed
+        from latentsync.whisper.audio2feature import Audio2Feature
+
+        print("All imports successful!")
+
+        # Convert paths to absolute
+        video_path = os.path.abspath(video_path)
+        audio_path = os.path.abspath(audio_path)
+
+        # Hardcoded configuration paths
+        unet_config_path = "configs/unet/stage2_512.yaml"
+        inference_ckpt_path = "checkpoints/latentsync_unet.pt"
+
+        if not os.path.exists(unet_config_path):
+            raise FileNotFoundError(f"Config file not found: {unet_config_path}")
+        if not os.path.exists(inference_ckpt_path):
+            raise FileNotFoundError(f"Checkpoint file not found: {inference_ckpt_path}")
+
+        # Load configuration
+        config = OmegaConf.load(unet_config_path)
+
+        # Check CUDA and determine dtype
+        if not torch.cuda.is_available():
+            raise RuntimeError("CUDA is required for inference")
+
+        is_fp16_supported = torch.cuda.get_device_capability()[0] >= 7
+        dtype = torch.float16 if is_fp16_supported else torch.float32
+
+        print(f"Using dtype: {dtype}")
+        print(f"CUDA device: {torch.cuda.get_device_name()}")
+
+        # Load models
+        print("Loading scheduler...")
+        scheduler = DDIMScheduler.from_pretrained("configs")
+
+        # Determine whisper model based on config
+        if config.model.cross_attention_dim == 768:
+            whisper_model_path = "checkpoints/whisper/small.pt"
+        elif config.model.cross_attention_dim == 384:
+            whisper_model_path = "checkpoints/whisper/tiny.pt"
+        else:
+            raise NotImplementedError("cross_attention_dim must be 768 or 384")
+
+        if not os.path.exists(whisper_model_path):
+            raise FileNotFoundError(f"Whisper model not found: {whisper_model_path}")
+
+        print("Loading audio encoder...")
+        audio_encoder = Audio2Feature(
+            model_path=whisper_model_path,
+            device="cuda",
+            num_frames=config.data.num_frames,
+            audio_feat_length=config.data.audio_feat_length,
+        )
+
+        print("Loading VAE...")
+        vae = AutoencoderKL.from_pretrained("stabilityai/sd-vae-ft-mse", torch_dtype=dtype)
+        vae.config.scaling_factor = 0.18215
+        vae.config.shift_factor = 0
+
+        print("Loading UNet...")
+        unet, _ = UNet3DConditionModel.from_pretrained(
+            OmegaConf.to_container(config.model),
+            inference_ckpt_path,
+            device="cpu",
+        )
+        unet = unet.to(dtype=dtype)
+
+        print("Creating pipeline...")
+        pipeline = LipsyncPipeline(
+            vae=vae,
+            audio_encoder=audio_encoder,
+            unet=unet,
+            scheduler=scheduler,
+        ).to("cuda")
+
+        # Set parameters
+        inference_steps = 20
+        guidance_scale = 1.5
+        seed = 1247
+
+        # Create pipeline temp directory
+        pipeline_temp_dir = os.path.join(temp_dir, "pipeline_temp")
+        os.makedirs(pipeline_temp_dir, exist_ok=True)
+
+        # Set seed
+        if seed != -1:
+            set_seed(seed)
+        else:
+            torch.seed()
+
+        print(f"Using seed: {torch.initial_seed()}")
+
+        # Prepare output path
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        temp_output_path = f"{temp_dir}/inference_output_{timestamp}.mp4"
+
+        print("Running inference...")
+        print(f"Input video: {video_path}")
+        print(f"Input audio: {audio_path}")
+        print(f"Output will be: {temp_output_path}")
+
+        # Run pipeline
+        pipeline(
+            video_path=video_path,
+            audio_path=audio_path,
+            video_out_path=temp_output_path,
+            num_frames=config.data.num_frames,
+            num_inference_steps=inference_steps,
+            guidance_scale=guidance_scale,
+            weight_dtype=dtype,
+            width=config.data.resolution,
+            height=config.data.resolution,
+            mask_image_path=config.data.mask_image_path,
+            temp_dir=pipeline_temp_dir,
+        )
+
+        if not os.path.exists(temp_output_path):
+            raise RuntimeError(f"Inference failed - output not created: {temp_output_path}")
+
+        print(f"Inference completed successfully: {temp_output_path}")
+        return temp_output_path
+
+    except ImportError as e:
+        print(f"Import error - environment not properly set up: {e}")
+        print("Please ensure all LatentSync dependencies are installed")
+        raise
+    except Exception as e:
+        print(f"Inference failed: {e}")
         raise
 
 
-def replace_audio_in_video(video_path, original_audio_path, output_path):
-    """Replace audio in video with original high-quality audio using ffmpeg"""
-    video_path = os.path.abspath(video_path)
-    original_audio_path = os.path.abspath(original_audio_path)
-    output_path = os.path.abspath(output_path)
+def replace_audio_in_video(video_path, audio_path, output_path):
+    """Replace audio in video with high-quality original audio"""
+    cmd = [
+        'ffmpeg', '-y',
+        '-i', video_path,
+        '-i', audio_path,
+        '-c:v', 'copy',
+        '-c:a', 'aac',
+        '-b:a', '192k',
+        '-map', '0:v:0',
+        '-map', '1:a:0',
+        '-shortest',
+        output_path
+    ]
 
-    print(f"Replacing audio in {video_path} with original audio from {original_audio_path}")
-    print(f"Final output: {output_path}")
-
-    try:
-        result = subprocess.run([
-            'ffmpeg',
-            '-i', video_path,           # Input video (with lip-sync)
-            '-i', original_audio_path,  # Original high-quality audio
-            '-c:v', 'copy',             # Copy video stream without re-encoding
-            '-c:a', 'aac',              # Encode audio as AAC
-            '-b:a', '192k',             # High quality audio bitrate
-            '-map', '0:v:0',            # Use video from first input
-            '-map', '1:a:0',            # Use audio from second input
-            '-shortest',                # Match duration to shortest stream
-            '-y',                       # Overwrite output file
-            output_path
-        ], check=True, capture_output=True, text=True)
-        print(f"Audio replacement completed: {output_path}")
-    except subprocess.CalledProcessError as e:
-        print(f"FFmpeg stderr: {e.stderr}")
-        print(f"FFmpeg stdout: {e.stdout}")
-        raise RuntimeError(f"FFmpeg audio replacement failed: {e.stderr}")
-
-
-def process_video_audio_sync(video_path, audio_path, temp_directory_path,
-                             add_silence=True, silence_location=SilenceLocation.END,
-                             loop_from_end=True):
-    """Process video and audio to match durations"""
-
-    # Convert video to 25 FPS first
-    video_25fps = convert_video_fps(video_path, 25, temp_directory_path, "base")
-
-    # Get durations
-    video_duration = get_video_duration(video_25fps)
-    waveform, sample_rate = torchaudio.load(audio_path)
-    audio_duration = waveform.shape[1] / sample_rate
-
-    logger.info(f"Durations - Video: {video_duration:.2f}s, Audio: {audio_duration:.2f}s")
-
-    processed_video = video_25fps
-    processed_audio = audio_path
-
-    # Handle duration mismatch
-    if abs(video_duration - audio_duration) > 0.1:
-        if audio_duration > video_duration:
-            logger.info(f"Extending video by {audio_duration - video_duration:.2f}s")
-            processed_video = extend_video(video_25fps, audio_duration, temp_directory_path, loop_from_end)
-        else:
-            if add_silence:
-                silence_duration = video_duration - audio_duration
-                logger.info(f"Adding {silence_duration:.2f}s silence to audio ({silence_location.value})")
-                processed_audio = add_silence_to_audio(audio_path, temp_directory_path, silence_location, silence_duration)
-            else:
-                logger.info(f"Trimming video by {video_duration - audio_duration:.2f}s")
-                processed_video = trim_video(video_25fps, audio_duration, temp_directory_path)
-
-    return processed_video, processed_audio
-
-
-def main_inference(video_path, audio_wav_path, temp_output_path, download_temp_dir):
-    """Main inference method with hardcoded config paths"""
-
-    # Convert all paths to absolute paths
-    video_path = os.path.abspath(video_path)
-    audio_wav_path = os.path.abspath(audio_wav_path)
-    temp_output_path = os.path.abspath(temp_output_path)
-
-    # Hardcoded configuration paths
-    unet_config_path = "configs/unet/stage2_512.yaml"
-    inference_ckpt_path = "checkpoints/latentsync_unet.pt"
-
-    # Load configuration
-    config = OmegaConf.load(unet_config_path)
-
-    # Check input files exist with detailed info
-    print(f"Checking video file: {video_path}")
-    print(f"Video file exists: {os.path.exists(video_path)}")
-    if os.path.exists(video_path):
-        print(f"Video file size: {os.path.getsize(video_path)} bytes")
-    else:
-        raise RuntimeError(f"Video path '{video_path}' not found")
-
-    print(f"Checking audio file: {audio_wav_path}")
-    print(f"Audio file exists: {os.path.exists(audio_wav_path)}")
-    if os.path.exists(audio_wav_path):
-        print(f"Audio file size: {os.path.getsize(audio_wav_path)} bytes")
-    else:
-        raise RuntimeError(f"Audio path '{audio_wav_path}' not found")
-
-    # Check if the GPU supports float16
-    is_fp16_supported = torch.cuda.is_available() and torch.cuda.get_device_capability()[0] > 7
-    dtype = torch.float16 if is_fp16_supported else torch.float32
-
-    print(f"Input video path (absolute): {video_path}")
-    print(f"Input audio path (absolute): {audio_wav_path}")
-    print(f"Loaded checkpoint path: {inference_ckpt_path}")
-    print(f"Temporary output path (absolute): {temp_output_path}")
-
-    scheduler = DDIMScheduler.from_pretrained("configs")
-
-    if config.model.cross_attention_dim == 768:
-        whisper_model_path = "checkpoints/whisper/small.pt"
-    elif config.model.cross_attention_dim == 384:
-        whisper_model_path = "checkpoints/whisper/tiny.pt"
-    else:
-        raise NotImplementedError("cross_attention_dim must be 768 or 384")
-
-    audio_encoder = Audio2Feature(
-        model_path=whisper_model_path,
-        device="cuda",
-        num_frames=config.data.num_frames,
-        audio_feat_length=config.data.audio_feat_length,
-    )
-
-    vae = AutoencoderKL.from_pretrained("stabilityai/sd-vae-ft-mse", torch_dtype=dtype)
-    vae.config.scaling_factor = 0.18215
-    vae.config.shift_factor = 0
-
-    unet, _ = UNet3DConditionModel.from_pretrained(
-        OmegaConf.to_container(config.model),
-        inference_ckpt_path,
-        device="cpu",
-    )
-
-    unet = unet.to(dtype=dtype)
-
-    pipeline = LipsyncPipeline(
-        vae=vae,
-        audio_encoder=audio_encoder,
-        unet=unet,
-        scheduler=scheduler,
-    ).to("cuda")
-
-    # Default parameters
-    inference_steps = 20
-    guidance_scale = 1.5
-    seed = 1247
-
-    # Create separate temp dir for pipeline processing (not where downloads are stored)
-    pipeline_temp_dir = os.path.join(download_temp_dir, "pipeline_temp")
-    os.makedirs(pipeline_temp_dir, exist_ok=True)
-
-    if seed != -1:
-        set_seed(seed)
-    else:
-        torch.seed()
-
-    print(f"Initial seed: {torch.initial_seed()}")
-    print(f"Pipeline temp dir: {pipeline_temp_dir}")
-
-    # Double-check files exist right before pipeline call
-    print(f"Final check - Video exists: {os.path.exists(video_path)}")
-    print(f"Final check - Audio exists: {os.path.exists(audio_wav_path)}")
-
-    # Run the pipeline with separate temp directory
-    pipeline(
-        video_path=video_path,
-        audio_path=audio_wav_path,
-        video_out_path=temp_output_path,
-        num_frames=config.data.num_frames,
-        num_inference_steps=inference_steps,
-        guidance_scale=guidance_scale,
-        weight_dtype=dtype,
-        width=config.data.resolution,
-        height=config.data.resolution,
-        mask_image_path=config.data.mask_image_path,
-        temp_dir=pipeline_temp_dir,  # Use separate temp dir for pipeline
-    )
-
-    print(f"Lip-sync inference completed. Temporary output saved to: {temp_output_path}")
+    run_ffmpeg_command(cmd, "Replacing audio in final video")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="LatentSync inference with URL inputs and duration matching")
+    parser = argparse.ArgumentParser(description="LatentSync inference with URL inputs and complete processing")
     parser.add_argument("--video_url", type=str, required=True, help="URL of the input video")
     parser.add_argument("--audio_url", type=str, required=True, help="URL of the input audio")
     parser.add_argument("--output_path", type=str, required=True, help="Path for output video")
-    parser.add_argument("--temp_dir", type=str, default="temp1", help="Temporary directory for downloads")
-    parser.add_argument("--add_silence", action="store_true", default=True, help="Add silence to audio if shorter than video")
-    parser.add_argument("--silence_location", type=str, choices=['start', 'end'], default='end',
-                        help="Where to add silence (start or end)")
-    parser.add_argument("--loop_from_end", action="store_true", default=True,
-                        help="Loop video by reversing from end (creates smoother loop)")
+    parser.add_argument("--temp_dir", type=str, default="temp_processing", help="Temporary directory")
+    parser.add_argument("--duration_strategy", type=str, choices=['extend_video', 'add_silence', 'trim'],
+                        default='extend_video', help="Strategy for handling duration mismatches")
     parser.add_argument("--output_fps", type=int, default=25, help="Output video FPS")
+    parser.add_argument("--cleanup", action="store_true", default=True, help="Clean up temp files after processing")
 
     args = parser.parse_args()
 
-    # Create temporary directory with absolute path
+    # Setup directories
     temp_dir = os.path.abspath(args.temp_dir)
     os.makedirs(temp_dir, exist_ok=True)
-    print(f"Using temporary directory: {temp_dir}")
 
-    # Test URLs accessibility
-    print(f"Video URL: {args.video_url}")
-    print(f"Audio URL: {args.audio_url}")
+    output_dir = os.path.dirname(os.path.abspath(args.output_path))
+    os.makedirs(output_dir, exist_ok=True)
 
-    video_path = None
-    original_audio_path = None
-    audio_wav_path = None
-    temp_output_path = None
+    print(f"Temporary directory: {temp_dir}")
+    print(f"Output path: {args.output_path}")
+    print(f"Duration strategy: {args.duration_strategy}")
+    print(f"Output FPS: {args.output_fps}")
 
     try:
-        # Download video and audio files
-        print("=" * 50)
-        print("DOWNLOADING FILES")
-        print("=" * 50)
+        # Step 1: Download files
+        print("\n" + "="*60)
+        print("STEP 1: DOWNLOADING FILES")
+        print("="*60)
 
         print("Downloading video...")
         video_path = download_file(args.video_url, temp_dir)
@@ -533,109 +518,116 @@ def main():
         print("Downloading audio...")
         original_audio_path = download_file(args.audio_url, temp_dir)
 
-        # Verify files were downloaded successfully
-        if not os.path.exists(video_path):
-            raise RuntimeError(f"Failed to download video from {args.video_url}")
-        if not os.path.exists(original_audio_path):
-            raise RuntimeError(f"Failed to download audio from {args.audio_url}")
+        print(f"\nDownloaded files:")
+        print(f"Video: {video_path} ({os.path.getsize(video_path):,} bytes)")
+        print(f"Audio: {original_audio_path} ({os.path.getsize(original_audio_path):,} bytes)")
 
-        print(f"\nDownload Summary:")
-        print(f"Video: {video_path} ({os.path.getsize(video_path)} bytes)")
-        print(f"Audio: {original_audio_path} ({os.path.getsize(original_audio_path)} bytes)")
+        # Step 2: Convert audio to WAV if needed
+        print("\n" + "="*60)
+        print("STEP 2: AUDIO CONVERSION")
+        print("="*60)
 
-        # Convert audio to WAV for inference if needed
-        audio_wav_path = os.path.join(temp_dir, "audio_for_inference.wav")
-        audio_wav_path = os.path.abspath(audio_wav_path)
-
-        # Check if audio is already in WAV format
         if original_audio_path.lower().endswith('.wav'):
             print("Audio is already in WAV format")
             audio_wav_path = original_audio_path
         else:
+            audio_wav_path = os.path.join(temp_dir, "converted_audio.wav")
             convert_audio_to_wav(original_audio_path, audio_wav_path)
 
-        # Process video and audio to match durations
-        print("\n" + "=" * 50)
-        print("PROCESSING VIDEO AND AUDIO SYNC")
-        print("=" * 50)
+        # Step 3: Convert video to 25fps for processing
+        print("\n" + "="*60)
+        print("STEP 3: VIDEO PREPROCESSING")
+        print("="*60)
 
-        silence_location = SilenceLocation.START if args.silence_location == 'start' else SilenceLocation.END
-        processed_video, processed_audio = process_video_audio_sync(
-            video_path, audio_wav_path, temp_dir,
-            add_silence=args.add_silence,
-            silence_location=silence_location,
-            loop_from_end=args.loop_from_end
+        video_25fps = convert_video_fps(video_path, 25, temp_dir)
+
+        # Step 4: Match durations
+        print("\n" + "="*60)
+        print("STEP 4: DURATION MATCHING")
+        print("="*60)
+
+        processed_video, processed_audio = match_video_audio_duration(
+            video_25fps, audio_wav_path, temp_dir, args.duration_strategy
         )
 
-        # Pad audio to multiple of 16 frames
-        print("Padding audio to multiple of 16 frames...")
-        padded_audio, final_frames = pad_audio_to_multiple_of_16(processed_audio, temp_dir)
-        print(f"Final audio frames: {final_frames}")
+        # Step 5: Pad audio for model compatibility
+        print("\n" + "="*60)
+        print("STEP 5: AUDIO PADDING FOR INFERENCE")
+        print("="*60)
 
-        # Create temporary output path for lip-sync video (without final audio)
-        temp_output_path = os.path.join(temp_dir, "lipsync_output_temp.mp4")
-        temp_output_path = os.path.abspath(temp_output_path)
+        padded_audio, num_frames = pad_audio_for_inference(processed_audio, temp_dir)
+        print(f"Audio prepared for inference: {num_frames} frames")
 
-        # Run main inference - pass the download temp dir so pipeline can create its own subdir
-        print("\n" + "=" * 50)
-        print("RUNNING LIP-SYNC INFERENCE")
-        print("=" * 50)
-        main_inference(processed_video, padded_audio, temp_output_path, temp_dir)
+        # Step 6: Run LatentSync inference
+        print("\n" + "="*60)
+        print("STEP 6: LATENTSYNC INFERENCE")
+        print("="*60)
 
-        # Verify inference output exists
-        if not os.path.exists(temp_output_path):
-            raise RuntimeError(f"Inference failed - output file not created: {temp_output_path}")
+        inference_output = run_latentsync_inference(processed_video, padded_audio, temp_dir)
 
-        print(f"Inference output size: {os.path.getsize(temp_output_path)} bytes")
+        # Step 7: Convert to desired output FPS
+        print("\n" + "="*60)
+        print("STEP 7: OUTPUT FPS CONVERSION")
+        print("="*60)
 
-        # Convert FPS if needed
-        final_video = temp_output_path
         if args.output_fps != 25:
-            print(f"Converting to {args.output_fps} FPS...")
-            final_video = convert_video_fps(temp_output_path, args.output_fps, temp_dir, "final")
+            final_video = convert_video_fps(inference_output, args.output_fps, temp_dir)
+        else:
+            final_video = inference_output
 
-        # Replace audio with original high-quality audio
-        print("\n" + "=" * 50)
-        print("REPLACING WITH ORIGINAL AUDIO")
-        print("=" * 50)
-        output_path = os.path.abspath(args.output_path)
-        replace_audio_in_video(final_video, original_audio_path, output_path)
+        # Step 8: Replace with original high-quality audio
+        print("\n" + "="*60)
+        print("STEP 8: FINAL AUDIO REPLACEMENT")
+        print("="*60)
 
-        print(f"\nProcess completed successfully! Final output: {output_path}")
+        replace_audio_in_video(final_video, original_audio_path, args.output_path)
 
-        # Only cleanup on success
-        print("Cleaning up temporary files...")
+        # Verify output
+        if os.path.exists(args.output_path):
+            output_size = os.path.getsize(args.output_path)
+            print(f"\n✅ SUCCESS! Output created: {args.output_path} ({output_size:,} bytes)")
 
-        # Clean up the entire temp directory
-        import shutil
-        if os.path.exists(temp_dir):
+            # Show output info
+            output_info = get_media_info(args.output_path)
+            print(f"Output duration: {output_info['duration']:.2f}s")
+            print(f"Has audio: {output_info['has_audio']}")
+        else:
+            raise RuntimeError("Output file was not created")
+
+        # Cleanup
+        if args.cleanup:
+            print("\n" + "="*60)
+            print("CLEANING UP")
+            print("="*60)
+
             try:
                 shutil.rmtree(temp_dir)
-                print(f"Cleaned up temp directory: {temp_dir}")
+                print(f"✅ Cleaned up temporary directory: {temp_dir}")
             except Exception as e:
-                print(f"Warning: Could not clean up temp directory {temp_dir}: {e}")
+                print(f"⚠️  Warning: Could not clean up {temp_dir}: {e}")
 
+        print(f"\n🎉 ALL DONE! Final output: {args.output_path}")
         return 0
 
     except Exception as e:
-        print(f"\nError: {e}")
-        print(f"Temporary files preserved for debugging in: {temp_dir}")
+        print(f"\n❌ ERROR: {e}")
+        print(f"Temporary files preserved in: {temp_dir}")
 
-        # Print debug info about existing files
+        # Show temp directory contents for debugging
         if os.path.exists(temp_dir):
-            print("\nFiles in temp directory:")
-            try:
-                for root, dirs, files in os.walk(temp_dir):
-                    level = root.replace(temp_dir, '').count(os.sep)
-                    indent = ' ' * 2 * level
-                    print(f"{indent}{os.path.basename(root)}/")
-                    subindent = ' ' * 2 * (level + 1)
-                    for file in files:
+            print("\nTemporary files:")
+            for root, dirs, files in os.walk(temp_dir):
+                level = root.replace(temp_dir, '').count(os.sep)
+                indent = '  ' * level
+                print(f"{indent}{os.path.basename(root)}/")
+                subindent = '  ' * (level + 1)
+                for file in files:
+                    try:
                         file_path = os.path.join(root, file)
-                        if os.path.isfile(file_path):
-                            print(f"{subindent}{file} ({os.path.getsize(file_path)} bytes)")
-            except Exception as walk_error:
-                print(f"Error walking directory: {walk_error}")
+                        size = os.path.getsize(file_path)
+                        print(f"{subindent}{file} ({size:,} bytes)")
+                    except:
+                        print(f"{subindent}{file} (size unknown)")
 
         return 1
 
