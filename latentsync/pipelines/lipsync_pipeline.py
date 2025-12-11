@@ -1,3 +1,4 @@
+
 # Adapted from https://github.com/guoyww/AnimateDiff/blob/main/animatediff/pipelines/pipeline_animation.py
 
 import inspect
@@ -249,23 +250,122 @@ class LipsyncPipeline(DiffusionPipeline):
         images = images.cpu().numpy()
         return images
 
-    def detect_audio_presence(self, whisper_chunks, audio_threshold=0.01):
+    def detect_audio_presence_from_raw_audio(self, audio_path, video_fps, silence_threshold_db=-40, min_duration=0.1):
         """
-        Detect which chunks have actual audio content based on feature magnitude
-        Returns a boolean list indicating presence of audio for each frame
+        Detect audio presence by analyzing the raw audio signal instead of whisper features
+        This is more reliable for detecting actual silence vs whisper baseline features
         """
+        try:
+            import librosa
+        except ImportError:
+            print("Warning: librosa not available, falling back to whisper feature analysis")
+            return None
+
+        # Load audio
+        audio_data, sr = librosa.load(audio_path, sr=None)
+
+        # Calculate frame duration in samples
+        frame_duration = 1.0 / video_fps
+        frame_samples = int(frame_duration * sr)
+
+        audio_presence = []
+
+        for i in range(0, len(audio_data), frame_samples):
+            frame_audio = audio_data[i:i + frame_samples]
+
+            if len(frame_audio) == 0:
+                audio_presence.append(False)
+                continue
+
+            # Calculate RMS energy and convert to dB
+            rms = np.sqrt(np.mean(frame_audio ** 2))
+            if rms > 0:
+                db = 20 * np.log10(rms)
+            else:
+                db = -np.inf
+
+            # Check if above silence threshold
+            has_audio = db > silence_threshold_db
+            audio_presence.append(has_audio)
+
+        return audio_presence
+
+    def detect_audio_presence(self, whisper_chunks, audio_path=None, video_fps=25, method="adaptive"):
+        """
+        Enhanced audio presence detection with multiple methods
+        """
+        if method == "raw_audio" and audio_path is not None:
+            # Method 1: Analyze raw audio signal (most reliable)
+            raw_audio_presence = self.detect_audio_presence_from_raw_audio(audio_path, video_fps)
+            if raw_audio_presence is not None:
+                # Pad or trim to match whisper_chunks length
+                if len(raw_audio_presence) != len(whisper_chunks):
+                    if len(raw_audio_presence) < len(whisper_chunks):
+                        # Pad with False
+                        raw_audio_presence.extend([False] * (len(whisper_chunks) - len(raw_audio_presence)))
+                    else:
+                        # Trim
+                        raw_audio_presence = raw_audio_presence[:len(whisper_chunks)]
+                print(f"Using raw audio analysis: detected audio in {sum(raw_audio_presence)}/{len(raw_audio_presence)} frames")
+                return raw_audio_presence
+
+        # Method 2: Adaptive whisper feature analysis
+        if method == "adaptive" or method == "whisper":
+            # Calculate statistics across all chunks
+            chunk_energies = []
+            chunk_variances = []
+
+            for chunk in whisper_chunks:
+                if isinstance(chunk, torch.Tensor):
+                    chunk_np = chunk.detach().cpu().numpy()
+                else:
+                    chunk_np = chunk
+
+                # Calculate multiple metrics
+                energy = np.sum(chunk_np ** 2)
+                variance = np.var(chunk_np)
+                max_val = np.max(np.abs(chunk_np))
+
+                chunk_energies.append(energy)
+                chunk_variances.append(variance)
+
+            chunk_energies = np.array(chunk_energies)
+            chunk_variances = np.array(chunk_variances)
+
+            # Use adaptive thresholding based on distribution
+            if len(chunk_energies) > 0:
+                # Calculate percentile-based thresholds
+                energy_threshold = np.percentile(chunk_energies, 75)  # Top 25% by energy
+                variance_threshold = np.percentile(chunk_variances, 75)  # Top 25% by variance
+
+                # Also use a minimum absolute threshold to catch very quiet audio
+                min_energy_threshold = max(np.mean(chunk_energies) * 2, 0.001)
+                energy_threshold = max(energy_threshold, min_energy_threshold)
+
+                print(f"Adaptive thresholds - Energy: {energy_threshold:.6f}, Variance: {variance_threshold:.6f}")
+
+                audio_presence = []
+                for i, (energy, variance) in enumerate(zip(chunk_energies, chunk_variances)):
+                    # A frame has audio if it's above either threshold
+                    has_audio = energy > energy_threshold or variance > variance_threshold
+                    audio_presence.append(has_audio)
+
+                print(f"Adaptive method: detected audio in {sum(audio_presence)}/{len(audio_presence)} frames")
+                return audio_presence
+
+        # Method 3: Simple threshold (fallback)
+        print("Using simple threshold method")
         audio_presence = []
         for chunk in whisper_chunks:
-            # Calculate the energy/magnitude of the audio features
             if isinstance(chunk, torch.Tensor):
                 chunk_energy = torch.sum(chunk ** 2).item()
             else:
                 chunk_energy = np.sum(chunk ** 2)
 
-            # Check if energy is above threshold
-            has_audio = chunk_energy > audio_threshold
+            has_audio = chunk_energy > 0.01
             audio_presence.append(has_audio)
 
+        print(f"Simple method: detected audio in {sum(audio_presence)}/{len(audio_presence)} frames")
         return audio_presence
 
     def affine_transform_video(self, video_frames: np.ndarray):
@@ -348,7 +448,8 @@ class LipsyncPipeline(DiffusionPipeline):
             generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
             callback: Optional[Callable[[int, int, torch.FloatTensor], None]] = None,
             callback_steps: Optional[int] = 1,
-            audio_threshold: float = 0.01,  # New parameter for audio detection threshold
+            audio_detection_method: str = "raw_audio",  # "raw_audio", "adaptive", or "whisper"
+            silence_threshold_db: float = -40,  # dB threshold for raw audio method
             **kwargs,
     ):
         is_train = self.unet.training
@@ -384,9 +485,13 @@ class LipsyncPipeline(DiffusionPipeline):
         whisper_feature = self.audio_encoder.audio2feat(audio_path)
         whisper_chunks = self.audio_encoder.feature2chunks(feature_array=whisper_feature, fps=video_fps)
 
-        # Detect audio presence for each frame
-        audio_presence = self.detect_audio_presence(whisper_chunks, audio_threshold)
-        print(f"Detected audio in {sum(audio_presence)} out of {len(audio_presence)} frames")
+        # Enhanced audio presence detection
+        audio_presence = self.detect_audio_presence(
+            whisper_chunks,
+            audio_path=audio_path,
+            video_fps=video_fps,
+            method=audio_detection_method
+        )
 
         audio_samples = read_audio(audio_path)
         video_frames = read_video(video_path, use_decord=False)
