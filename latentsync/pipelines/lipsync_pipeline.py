@@ -688,12 +688,18 @@ class LipsyncPipeline(DiffusionPipeline):
             shutil.rmtree(temp_dir)
         os.makedirs(temp_dir, exist_ok=True)
 
-        write_video(os.path.join(temp_dir, "video.mp4"), synced_video_frames, fps=video_fps)
 
-        sf.write(os.path.join(temp_dir, "audio.wav"), audio_samples, audio_sample_rate)
 
         if not skip_merge_audio:
+            write_video(os.path.join(temp_dir, "video.mp4"), synced_video_frames, fps=video_fps)
+
+            sf.write(os.path.join(temp_dir, "audio.wav"), audio_samples, audio_sample_rate)
             command = f"ffmpeg -y -loglevel error -nostdin -i {os.path.join(temp_dir, 'video.mp4')} -i {os.path.join(temp_dir, 'audio.wav')} -c:v libx264 -crf 18 -c:a aac -q:v 0 -q:a 0 {video_out_path}"
             subprocess.run(command, shell=True)
+
+        else:
+            write_video(video_out_path, synced_video_frames, fps=video_fps)
+
+            sf.write(os.path.join(temp_dir, "audio.wav"), audio_samples, audio_sample_rate)
 
         return
