@@ -495,7 +495,7 @@ class LipsyncPipeline(DiffusionPipeline):
         )
 
         audio_samples = read_audio(audio_path)
-        video_frames = read_video(video_path, use_decord=False)
+        video_frames = read_video(video_path, change_fps=False, use_decord=False)
 
         video_frames, faces, boxes, affine_matrices = self.loop_video(whisper_chunks, video_frames)
 
