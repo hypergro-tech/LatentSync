@@ -44,18 +44,18 @@ class LipsyncPipeline(DiffusionPipeline):
     _optional_components = []
 
     def __init__(
-        self,
-        vae: AutoencoderKL,
-        audio_encoder: Audio2Feature,
-        unet: UNet3DConditionModel,
-        scheduler: Union[
-            DDIMScheduler,
-            PNDMScheduler,
-            LMSDiscreteScheduler,
-            EulerDiscreteScheduler,
-            EulerAncestralDiscreteScheduler,
-            DPMSolverMultistepScheduler,
-        ],
+            self,
+            vae: AutoencoderKL,
+            audio_encoder: Audio2Feature,
+            unet: UNet3DConditionModel,
+            scheduler: Union[
+                DDIMScheduler,
+                PNDMScheduler,
+                LMSDiscreteScheduler,
+                EulerDiscreteScheduler,
+                EulerAncestralDiscreteScheduler,
+                DPMSolverMultistepScheduler,
+            ],
     ):
         super().__init__()
 
@@ -130,9 +130,9 @@ class LipsyncPipeline(DiffusionPipeline):
             return self.device
         for module in self.unet.modules():
             if (
-                hasattr(module, "_hf_hook")
-                and hasattr(module._hf_hook, "execution_device")
-                and module._hf_hook.execution_device is not None
+                    hasattr(module, "_hf_hook")
+                    and hasattr(module._hf_hook, "execution_device")
+                    and module._hf_hook.execution_device is not None
             ):
                 return torch.device(module._hf_hook.execution_device)
         return self.device
@@ -167,7 +167,7 @@ class LipsyncPipeline(DiffusionPipeline):
             raise ValueError(f"`height` and `width` have to be divisible by 8 but are {height} and {width}.")
 
         if (callback_steps is None) or (
-            callback_steps is not None and (not isinstance(callback_steps, int) or callback_steps <= 0)
+                callback_steps is not None and (not isinstance(callback_steps, int) or callback_steps <= 0)
         ):
             raise ValueError(
                 f"`callback_steps` has to be a positive integer but is {callback_steps} of type"
@@ -191,7 +191,7 @@ class LipsyncPipeline(DiffusionPipeline):
         return latents
 
     def prepare_mask_latents(
-        self, mask, masked_image, height, width, dtype, device, generator, do_classifier_free_guidance
+            self, mask, masked_image, height, width, dtype, device, generator, do_classifier_free_guidance
     ):
         # resize the mask to latents shape as we concatenate the mask to the latents
         # we do that before converting to dtype to avoid breaking in case we're using cpu_offload
@@ -248,6 +248,25 @@ class LipsyncPipeline(DiffusionPipeline):
         images = (pixel_values * 255).to(torch.uint8)
         images = images.cpu().numpy()
         return images
+
+    def detect_audio_presence(self, whisper_chunks, audio_threshold=0.01):
+        """
+        Detect which chunks have actual audio content based on feature magnitude
+        Returns a boolean list indicating presence of audio for each frame
+        """
+        audio_presence = []
+        for chunk in whisper_chunks:
+            # Calculate the energy/magnitude of the audio features
+            if isinstance(chunk, torch.Tensor):
+                chunk_energy = torch.sum(chunk ** 2).item()
+            else:
+                chunk_energy = np.sum(chunk ** 2)
+
+            # Check if energy is above threshold
+            has_audio = chunk_energy > audio_threshold
+            audio_presence.append(has_audio)
+
+        return audio_presence
 
     def affine_transform_video(self, video_frames: np.ndarray):
         faces = []
@@ -311,25 +330,26 @@ class LipsyncPipeline(DiffusionPipeline):
 
     @torch.no_grad()
     def __call__(
-        self,
-        video_path: str,
-        audio_path: str,
-        video_out_path: str,
-        num_frames: int = 16,
-        video_fps: int = 25,
-        audio_sample_rate: int = 16000,
-        height: Optional[int] = None,
-        width: Optional[int] = None,
-        num_inference_steps: int = 20,
-        guidance_scale: float = 1.5,
-        weight_dtype: Optional[torch.dtype] = torch.float16,
-        eta: float = 0.0,
-        mask_image_path: str = "latentsync/utils/mask.png",
-        temp_dir: str = "temp",
-        generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
-        callback: Optional[Callable[[int, int, torch.FloatTensor], None]] = None,
-        callback_steps: Optional[int] = 1,
-        **kwargs,
+            self,
+            video_path: str,
+            audio_path: str,
+            video_out_path: str,
+            num_frames: int = 16,
+            video_fps: int = 25,
+            audio_sample_rate: int = 16000,
+            height: Optional[int] = None,
+            width: Optional[int] = None,
+            num_inference_steps: int = 20,
+            guidance_scale: float = 1.5,
+            weight_dtype: Optional[torch.dtype] = torch.float16,
+            eta: float = 0.0,
+            mask_image_path: str = "latentsync/utils/mask.png",
+            temp_dir: str = "temp",
+            generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
+            callback: Optional[Callable[[int, int, torch.FloatTensor], None]] = None,
+            callback_steps: Optional[int] = 1,
+            audio_threshold: float = 0.01,  # New parameter for audio detection threshold
+            **kwargs,
     ):
         is_train = self.unet.training
         self.unet.eval()
@@ -364,6 +384,10 @@ class LipsyncPipeline(DiffusionPipeline):
         whisper_feature = self.audio_encoder.audio2feat(audio_path)
         whisper_chunks = self.audio_encoder.feature2chunks(feature_array=whisper_feature, fps=video_fps)
 
+        # Detect audio presence for each frame
+        audio_presence = self.detect_audio_presence(whisper_chunks, audio_threshold)
+        print(f"Detected audio in {sum(audio_presence)} out of {len(audio_presence)} frames")
+
         audio_samples = read_audio(audio_path)
         video_frames = read_video(video_path, use_decord=False)
 
@@ -373,29 +397,65 @@ class LipsyncPipeline(DiffusionPipeline):
 
         num_channels_latents = self.vae.config.latent_channels
 
-        # Prepare latent variables
-        all_latents = self.prepare_latents(
-            len(whisper_chunks),
-            num_channels_latents,
-            height,
-            width,
-            weight_dtype,
-            device,
-            generator,
-        )
+        # Prepare latent variables only for frames with audio
+        frames_with_audio = [i for i, has_audio in enumerate(audio_presence) if has_audio]
+
+        if len(frames_with_audio) > 0:
+            all_latents = self.prepare_latents(
+                len(whisper_chunks),
+                num_channels_latents,
+                height,
+                width,
+                weight_dtype,
+                device,
+                generator,
+            )
+        else:
+            all_latents = None
+            print("No audio detected in any frame, skipping all lip sync processing")
 
         num_inferences = math.ceil(len(whisper_chunks) / num_frames)
+
         for i in tqdm.tqdm(range(num_inferences), desc="Doing inference..."):
+            chunk_start = i * num_frames
+            chunk_end = min((i + 1) * num_frames, len(whisper_chunks))
+            actual_frames = chunk_end - chunk_start
+
+            # Get current batch info
+            current_audio_presence = audio_presence[chunk_start:chunk_end]
+            has_audio_in_batch = any(current_audio_presence)
+
+            inference_faces = faces[chunk_start:chunk_end]
+
+            if not has_audio_in_batch:
+                # Skip lip sync processing, use original faces
+                print(f"Batch {i+1}: No audio detected, using original frames")
+
+                # Convert faces to proper format and add to results
+                if len(inference_faces) > 0:
+                    # Normalize faces to match expected output format
+                    normalized_faces = (inference_faces / 127.5 - 1.0).to(weight_dtype)
+                    synced_video_frames.append(normalized_faces)
+                continue
+
+            print(f"Batch {i+1}: Audio detected in {sum(current_audio_presence)}/{len(current_audio_presence)} frames, performing lip sync")
+
+            # Prepare audio embeddings for frames with audio
             if self.unet.add_audio_layer:
-                audio_embeds = torch.stack(whisper_chunks[i * num_frames : (i + 1) * num_frames])
+                current_whisper_chunks = whisper_chunks[chunk_start:chunk_end]
+                audio_embeds = torch.stack(current_whisper_chunks)
                 audio_embeds = audio_embeds.to(device, dtype=weight_dtype)
+
                 if do_classifier_free_guidance:
                     null_audio_embeds = torch.zeros_like(audio_embeds)
                     audio_embeds = torch.cat([null_audio_embeds, audio_embeds])
             else:
                 audio_embeds = None
-            inference_faces = faces[i * num_frames : (i + 1) * num_frames]
-            latents = all_latents[:, :, i * num_frames : (i + 1) * num_frames]
+
+            # Get latents for current batch
+            latents = all_latents[:, :, chunk_start:chunk_end]
+
+            # Prepare masks and images
             ref_pixel_values, masked_pixel_values, masks = self.image_processor.prepare_masks_and_masked_images(
                 inference_faces, affine_transform=False
             )
@@ -457,7 +517,14 @@ class LipsyncPipeline(DiffusionPipeline):
             )
             synced_video_frames.append(decoded_latents)
 
-        synced_video_frames = self.restore_video(torch.cat(synced_video_frames), video_frames, boxes, affine_matrices)
+        # Concatenate all processed frames
+        if synced_video_frames:
+            all_synced_frames = torch.cat(synced_video_frames, dim=0)
+            synced_video_frames = self.restore_video(all_synced_frames, video_frames, boxes, affine_matrices)
+        else:
+            # If no frames were processed, use original video
+            print("No frames processed, using original video")
+            synced_video_frames = video_frames
 
         audio_samples_remain_length = int(synced_video_frames.shape[0] / video_fps * audio_sample_rate)
         audio_samples = audio_samples[:audio_samples_remain_length].cpu().numpy()
