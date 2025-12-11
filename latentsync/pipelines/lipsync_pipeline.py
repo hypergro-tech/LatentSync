@@ -451,6 +451,7 @@ class LipsyncPipeline(DiffusionPipeline):
             callback_steps: Optional[int] = 1,
             audio_detection_method: str = "raw_audio",  # "raw_audio", "adaptive", or "whisper"
             silence_threshold_db: float = -40,  # dB threshold for raw audio method
+            skip_merge_audio: bool = False,
             **kwargs,
     ):
         is_train = self.unet.training
@@ -691,5 +692,8 @@ class LipsyncPipeline(DiffusionPipeline):
 
         sf.write(os.path.join(temp_dir, "audio.wav"), audio_samples, audio_sample_rate)
 
-        command = f"ffmpeg -y -loglevel error -nostdin -i {os.path.join(temp_dir, 'video.mp4')} -i {os.path.join(temp_dir, 'audio.wav')} -c:v libx264 -crf 18 -c:a aac -q:v 0 -q:a 0 {video_out_path}"
-        subprocess.run(command, shell=True)
+        if not skip_merge_audio:
+            command = f"ffmpeg -y -loglevel error -nostdin -i {os.path.join(temp_dir, 'video.mp4')} -i {os.path.join(temp_dir, 'audio.wav')} -c:v libx264 -crf 18 -c:a aac -q:v 0 -q:a 0 {video_out_path}"
+            subprocess.run(command, shell=True)
+
+        return
