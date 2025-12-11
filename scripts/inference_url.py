@@ -607,13 +607,13 @@ def main():
         print("Cleaning up temporary files...")
 
         # Clean up the entire temp directory
-        import shutil
-        if os.path.exists(temp_dir):
-            try:
-                shutil.rmtree(temp_dir)
-                print(f"Cleaned up temp directory: {temp_dir}")
-            except Exception as e:
-                print(f"Warning: Could not clean up temp directory {temp_dir}: {e}")
+        # import shutil
+        # if os.path.exists(temp_dir):
+        #     try:
+        #         shutil.rmtree(temp_dir)
+        #         print(f"Cleaned up temp directory: {temp_dir}")
+        #     except Exception as e:
+        #         print(f"Warning: Could not clean up temp directory {temp_dir}: {e}")
 
         return 0
 
@@ -621,21 +621,21 @@ def main():
         print(f"\nError: {e}")
         print(f"Temporary files preserved for debugging in: {temp_dir}")
 
-        # Print debug info about existing files
-        if os.path.exists(temp_dir):
-            print("\nFiles in temp directory:")
-            try:
-                for root, dirs, files in os.walk(temp_dir):
-                    level = root.replace(temp_dir, '').count(os.sep)
-                    indent = ' ' * 2 * level
-                    print(f"{indent}{os.path.basename(root)}/")
-                    subindent = ' ' * 2 * (level + 1)
-                    for file in files:
-                        file_path = os.path.join(root, file)
-                        if os.path.isfile(file_path):
-                            print(f"{subindent}{file} ({os.path.getsize(file_path)} bytes)")
-            except Exception as walk_error:
-                print(f"Error walking directory: {walk_error}")
+        # # Print debug info about existing files
+        # if os.path.exists(temp_dir):
+        #     print("\nFiles in temp directory:")
+        #     try:
+        #         for root, dirs, files in os.walk(temp_dir):
+        #             level = root.replace(temp_dir, '').count(os.sep)
+        #             indent = ' ' * 2 * level
+        #             print(f"{indent}{os.path.basename(root)}/")
+        #             subindent = ' ' * 2 * (level + 1)
+        #             for file in files:
+        #                 file_path = os.path.join(root, file)
+        #                 if os.path.isfile(file_path):
+        #                     print(f"{subindent}{file} ({os.path.getsize(file_path)} bytes)")
+        #     except Exception as walk_error:
+        #         print(f"Error walking directory: {walk_error}")
 
         return 1
 
