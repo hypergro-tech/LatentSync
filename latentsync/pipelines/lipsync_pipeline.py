@@ -292,8 +292,9 @@ class LipsyncPipeline(DiffusionPipeline):
 
     def detect_audio_presence(self, whisper_chunks, audio_path=None, video_fps=25, method="adaptive"):
         """
-        Enhanced audio presence detection with multiple methods
+        Enhanced audio presence detection with multiple methods and temporal padding
         """
+        audio_presence = []
         if method == "raw_audio" and audio_path is not None:
             # Method 1: Analyze raw audio signal (most reliable)
             raw_audio_presence = self.detect_audio_presence_from_raw_audio(audio_path, video_fps)
@@ -307,10 +308,10 @@ class LipsyncPipeline(DiffusionPipeline):
                         # Trim
                         raw_audio_presence = raw_audio_presence[:len(whisper_chunks)]
                 print(f"Using raw audio analysis: detected audio in {sum(raw_audio_presence)}/{len(raw_audio_presence)} frames")
-                return raw_audio_presence
+                audio_presence = raw_audio_presence
 
         # Method 2: Adaptive whisper feature analysis
-        if method == "adaptive" or method == "whisper":
+        elif (method == "adaptive" or method == "whisper") and not audio_presence:
             # Calculate statistics across all chunks
             chunk_energies = []
             chunk_variances = []
@@ -344,28 +345,40 @@ class LipsyncPipeline(DiffusionPipeline):
 
                 print(f"Adaptive thresholds - Energy: {energy_threshold:.6f}, Variance: {variance_threshold:.6f}")
 
-                audio_presence = []
                 for i, (energy, variance) in enumerate(zip(chunk_energies, chunk_variances)):
                     # A frame has audio if it's above either threshold
                     has_audio = energy > energy_threshold or variance > variance_threshold
                     audio_presence.append(has_audio)
 
                 print(f"Adaptive method: detected audio in {sum(audio_presence)}/{len(audio_presence)} frames")
-                return audio_presence
 
         # Method 3: Simple threshold (fallback)
-        print("Using simple threshold method")
-        audio_presence = []
-        for chunk in whisper_chunks:
-            if isinstance(chunk, torch.Tensor):
-                chunk_energy = torch.sum(chunk ** 2).item()
-            else:
-                chunk_energy = np.sum(chunk ** 2)
+        if not audio_presence:
+            print("Using simple threshold method")
+            for chunk in whisper_chunks:
+                if isinstance(chunk, torch.Tensor):
+                    chunk_energy = torch.sum(chunk ** 2).item()
+                else:
+                    chunk_energy = np.sum(chunk ** 2)
 
-            has_audio = chunk_energy > 0.01
-            audio_presence.append(has_audio)
+                has_audio = chunk_energy > 0.01
+                audio_presence.append(has_audio)
 
-        print(f"Simple method: detected audio in {sum(audio_presence)}/{len(audio_presence)} frames")
+            print(f"Simple method: detected audio in {sum(audio_presence)}/{len(audio_presence)} frames")
+
+        # Apply temporal padding to smooth transitions and provide context for 3D UNet
+        if any(audio_presence):
+            padding = 5  # Number of frames to pad before and after
+            presence_np = np.array(audio_presence)
+            padded_presence = presence_np.copy()
+            for i in range(len(presence_np)):
+                if presence_np[i]:
+                    start = max(0, i - padding)
+                    end = min(len(presence_np), i + padding + 1)
+                    padded_presence[start:end] = True
+            audio_presence = padded_presence.tolist()
+            print(f"After temporal padding: audio in {sum(audio_presence)}/{len(audio_presence)} frames")
+
         return audio_presence
 
     def affine_transform_video(self, video_frames: np.ndarray):
@@ -440,7 +453,7 @@ class LipsyncPipeline(DiffusionPipeline):
             audio_sample_rate: int = 16000,
             height: Optional[int] = None,
             width: Optional[int] = None,
-            num_inference_steps: int = 20,
+            num_inference_steps: int = 30,
             guidance_scale: float = 1.5,
             weight_dtype: Optional[torch.dtype] = torch.float16,
             eta: float = 0.0,
@@ -450,7 +463,7 @@ class LipsyncPipeline(DiffusionPipeline):
             callback: Optional[Callable[[int, int, torch.FloatTensor], None]] = None,
             callback_steps: Optional[int] = 1,
             audio_detection_method: str = "raw_audio",  # "raw_audio", "adaptive", or "whisper"
-            silence_threshold_db: float = -40,  # dB threshold for raw audio method
+            silence_threshold_db: float = -35,  # dB threshold for raw audio method
             skip_merge_audio: bool = False,
             **kwargs,
     ):
