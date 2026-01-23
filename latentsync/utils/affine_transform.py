@@ -34,7 +34,7 @@ class AlignRestore(object):
             img,
             affine_matrix,
             (self.face_size[1], self.face_size[0]),
-            mode="bilinear",
+            mode="bicubic",
             padding_mode="fill",
             fill_value=self.fill_value,
         )
@@ -51,7 +51,7 @@ class AlignRestore(object):
         face = face.to(dtype=self.dtype).unsqueeze(0)
 
         inv_face = kornia.geometry.transform.warp_affine(
-            face, inv_affine_matrix, (h, w), mode="bilinear", padding_mode="fill", fill_value=self.fill_value
+            face, inv_affine_matrix, (h, w), mode="bicubic", padding_mode="fill", fill_value=self.fill_value
         ).squeeze(0)
         inv_face = (inv_face / 2 + 0.5).clamp(0, 1) * 255
 
@@ -93,6 +93,12 @@ class AlignRestore(object):
 
         img_back = rearrange(img_back, "c h w -> h w c").contiguous().to(dtype=torch.uint8)
         img_back = img_back.cpu().numpy()
+        
+        # Apply subtle sharpening to reduce blur
+        # Using unsharp mask: sharpened = original + amount * (original - blurred)
+        blurred = cv2.GaussianBlur(img_back, (0, 0), sigmaX=1.0)
+        img_back = cv2.addWeighted(img_back, 1.3, blurred, -0.3, 0)
+        
         return img_back
 
     def transformation_from_points(self, points1: torch.Tensor, points0: torch.Tensor, smooth=True, p_bias=None):

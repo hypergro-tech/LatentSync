@@ -455,15 +455,8 @@ class LipsyncPipeline(DiffusionPipeline):
             # Recover the pixel values
             decoded_latents = self.decode_latents(latents)
 
-            # Soften the mask edges to avoid sharp transitions between the generated mouth and the original face
-            # 1 - masks is the region where the generated output is pasted (mouth region)
-            soft_mask = 1 - masks
-            # Apply a smaller Gaussian blur to feather the mask edges more subtly
-            soft_mask = kornia.filters.gaussian_blur2d(soft_mask, (7, 7), (2.0, 2.0))
-            soft_mask = soft_mask.clamp(0, 1)
-
             decoded_latents = self.paste_surrounding_pixels_back(
-                decoded_latents, ref_pixel_values, soft_mask, device, weight_dtype
+                decoded_latents, ref_pixel_values, masks, device, weight_dtype
             )
             synced_video_frames.append(decoded_latents)
 
@@ -484,7 +477,7 @@ class LipsyncPipeline(DiffusionPipeline):
 
             sf.write(os.path.join(temp_dir, "audio.wav"), audio_samples, audio_sample_rate)
 
-            command = f"ffmpeg -y -loglevel error -nostdin -i {os.path.join(temp_dir, 'video.mp4')} -i {os.path.join(temp_dir, 'audio.wav')} -c:v libx264 -crf 18 -c:a aac -q:v 0 -q:a 0 {video_out_path}"
+            command = f"ffmpeg -y -loglevel error -nostdin -i {os.path.join(temp_dir, 'video.mp4')} -i {os.path.join(temp_dir, 'audio.wav')} -c:v libx264 -crf 15 -c:a aac -q:v 0 -q:a 0 {video_out_path}"
             subprocess.run(command, shell=True)
         else:
             write_video(video_out_path, synced_video_frames, fps=video_fps)
