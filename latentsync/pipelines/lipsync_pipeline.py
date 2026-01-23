@@ -322,7 +322,7 @@ class LipsyncPipeline(DiffusionPipeline):
             height: Optional[int] = None,
             width: Optional[int] = None,
             num_inference_steps: int = 30,
-            guidance_scale: float = 1.5,
+            guidance_scale: float = 1.7,
             weight_dtype: Optional[torch.dtype] = torch.float16,
             eta: float = 0.0,
             mask_image_path: str = "latentsync/utils/mask.png",
@@ -458,8 +458,9 @@ class LipsyncPipeline(DiffusionPipeline):
             # Soften the mask edges to avoid sharp transitions between the generated mouth and the original face
             # 1 - masks is the region where the generated output is pasted (mouth region)
             soft_mask = 1 - masks
-            # Apply a Gaussian blur to feather the mask edges
-            soft_mask = kornia.filters.gaussian_blur2d(soft_mask, (13, 13), (3.5, 3.5))
+            # Apply a smaller Gaussian blur to feather the mask edges more subtly
+            soft_mask = kornia.filters.gaussian_blur2d(soft_mask, (7, 7), (2.0, 2.0))
+            soft_mask = soft_mask.clamp(0, 1)
 
             decoded_latents = self.paste_surrounding_pixels_back(
                 decoded_latents, ref_pixel_values, soft_mask, device, weight_dtype
