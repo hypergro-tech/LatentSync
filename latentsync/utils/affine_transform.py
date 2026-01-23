@@ -34,7 +34,7 @@ class AlignRestore(object):
             img,
             affine_matrix,
             (self.face_size[1], self.face_size[0]),
-            mode="bicubic",
+            mode="bilinear",
             padding_mode="fill",
             fill_value=self.fill_value,
         )
@@ -51,7 +51,7 @@ class AlignRestore(object):
         face = face.to(dtype=self.dtype).unsqueeze(0)
 
         inv_face = kornia.geometry.transform.warp_affine(
-            face, inv_affine_matrix, (h, w), mode="bicubic", padding_mode="fill", fill_value=self.fill_value
+            face, inv_affine_matrix, (h, w), mode="bilinear", padding_mode="fill", fill_value=self.fill_value
         ).squeeze(0)
         inv_face = (inv_face / 2 + 0.5).clamp(0, 1) * 255
 
