@@ -453,8 +453,15 @@ class LipsyncPipeline(DiffusionPipeline):
 
             # Recover the pixel values
             decoded_latents = self.decode_latents(latents)
+
+            # Soften the mask edges to avoid sharp transitions between the generated mouth and the original face
+            # 1 - masks is the region where the generated output is pasted (mouth region)
+            soft_mask = 1 - masks
+            # Apply a simple average blur to feather the mask edges
+            soft_mask = torch.nn.functional.avg_pool2d(soft_mask, kernel_size=7, stride=1, padding=3)
+
             decoded_latents = self.paste_surrounding_pixels_back(
-                decoded_latents, ref_pixel_values, 1 - masks, device, weight_dtype
+                decoded_latents, ref_pixel_values, soft_mask, device, weight_dtype
             )
             synced_video_frames.append(decoded_latents)
 
