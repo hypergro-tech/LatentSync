@@ -456,7 +456,7 @@ class LipsyncPipeline(DiffusionPipeline):
             decoded_latents = self.decode_latents(latents)
 
             decoded_latents = self.paste_surrounding_pixels_back(
-                decoded_latents, ref_pixel_values, 1 - masks, device, weight_dtype
+                decoded_latents, ref_pixel_values, masks, device, weight_dtype
             )
             synced_video_frames.append(decoded_latents)
 
