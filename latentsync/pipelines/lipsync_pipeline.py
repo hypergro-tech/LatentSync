@@ -29,6 +29,7 @@ from diffusers.utils import deprecate, logging
 
 from einops import rearrange
 import cv2
+import kornia
 
 from ..models.unet import UNet3DConditionModel
 from ..utils.util import read_video, read_audio, write_video, check_ffmpeg_installed
@@ -457,8 +458,8 @@ class LipsyncPipeline(DiffusionPipeline):
             # Soften the mask edges to avoid sharp transitions between the generated mouth and the original face
             # 1 - masks is the region where the generated output is pasted (mouth region)
             soft_mask = 1 - masks
-            # Apply a simple average blur to feather the mask edges
-            soft_mask = torch.nn.functional.avg_pool2d(soft_mask, kernel_size=7, stride=1, padding=3)
+            # Apply a Gaussian blur to feather the mask edges
+            soft_mask = kornia.filters.gaussian_blur2d(soft_mask, (13, 13), (3.5, 3.5))
 
             decoded_latents = self.paste_surrounding_pixels_back(
                 decoded_latents, ref_pixel_values, soft_mask, device, weight_dtype
