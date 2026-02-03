@@ -371,6 +371,17 @@ class LipsyncPipeline(DiffusionPipeline):
 
         video_frames, faces, boxes, affine_matrices = self.loop_video(whisper_chunks, video_frames)
 
+        original_num_chunks = len(whisper_chunks)
+        remainder = original_num_chunks % num_frames
+        if remainder != 0:
+            pad_count = num_frames - remainder
+            for _ in range(pad_count):
+                whisper_chunks.append(whisper_chunks[-1])
+            faces = torch.cat([faces, faces[-1:].repeat(pad_count, 1, 1, 1)], dim=0)
+            video_frames = np.concatenate([video_frames, np.stack([video_frames[-1]] * pad_count)], axis=0)
+            boxes = boxes + [boxes[-1]] * pad_count
+            affine_matrices = affine_matrices + [affine_matrices[-1]] * pad_count
+
         synced_video_frames = []
 
         num_channels_latents = self.vae.config.latent_channels
@@ -461,6 +472,8 @@ class LipsyncPipeline(DiffusionPipeline):
             synced_video_frames.append(decoded_latents)
 
         synced_video_frames = self.restore_video(torch.cat(synced_video_frames), video_frames, boxes, affine_matrices)
+
+        synced_video_frames = synced_video_frames[:original_num_chunks]
 
         audio_samples_remain_length = int(synced_video_frames.shape[0] / video_fps * audio_sample_rate)
         audio_samples = audio_samples[:audio_samples_remain_length].cpu().numpy()
